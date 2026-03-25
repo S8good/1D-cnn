@@ -15,6 +15,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.core.full_spectrum_models import SpectralPredictorV2
 
 
+def _prepare_model_dirs(project_root: str):
+    models_root = os.path.join(project_root, "models")
+    checkpoints_dir = os.path.join(models_root, "checkpoints")
+    pretrained_dir = os.path.join(models_root, "pretrained")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(pretrained_dir, exist_ok=True)
+    return models_root, checkpoints_dir, pretrained_dir
+
+
 def _load_table(path: str) -> pd.DataFrame:
     ext = os.path.splitext(path)[1].lower()
     if ext in [".xlsx", ".xls"]:
@@ -145,6 +154,7 @@ def train() -> None:
     print(f"Using device: {device}")
 
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    _models_root, checkpoints_dir, pretrained_dir = _prepare_model_dirs(root)
     train_path = os.path.abspath(args.train)
     val_path = os.path.abspath(args.val)
     test_path = os.path.abspath(args.test)
@@ -188,8 +198,10 @@ def train() -> None:
 
     best_val = float("inf")
     best_state = None
+    best_epoch = 0
     epochs = args.epochs
     mono_weight = 0.15
+    checkpoint_interval = 20
 
     for epoch in range(epochs):
         model.train()
@@ -223,7 +235,26 @@ def train() -> None:
 
         if mean_val < best_val:
             best_val = mean_val
-            best_state = model.state_dict()
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
+            ckpt_path = os.path.join(checkpoints_dir, f"predictor_v2_epoch_{epoch + 1:04d}.pth")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "best_val": float(best_val),
+                    "best_epoch": int(best_epoch),
+                    "stats": stats,
+                    "wavelengths": wavelengths.astype(np.float32),
+                    "train_loss": mean_train,
+                    "val_loss": mean_val,
+                },
+                ckpt_path,
+            )
 
         if (epoch + 1) % 20 == 0:
             print(
@@ -247,10 +278,21 @@ def train() -> None:
     y_true_test = np.concatenate(true_test, axis=0)
     test_metrics = evaluate_regression(y_true_test, y_pred_test)
 
-    model_dir = os.path.join(root, "models")
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "spectral_predictor_v2.pth")
-    params_path = os.path.join(model_dir, "predictor_v2_norm_params.pth")
+    best_ckpt_path = os.path.join(checkpoints_dir, "predictor_v2_best.pth")
+    if best_state is not None:
+        torch.save(
+            {
+                "best_epoch": int(best_epoch),
+                "best_val": float(best_val),
+                "model_state_dict": best_state,
+                "stats": stats,
+                "wavelengths": wavelengths.astype(np.float32),
+            },
+            best_ckpt_path,
+        )
+
+    model_path = os.path.join(pretrained_dir, "spectral_predictor_v2.pth")
+    params_path = os.path.join(pretrained_dir, "predictor_v2_norm_params.pth")
     torch.save(model.state_dict(), model_path)
     torch.save(
         {
@@ -264,6 +306,7 @@ def train() -> None:
     )
     print(f"Saved: {model_path}")
     print(f"Saved: {params_path}")
+    print(f"Saved checkpoints under: {checkpoints_dir}")
 
     out_dir = os.path.join(root, "outputs")
     os.makedirs(out_dir, exist_ok=True)

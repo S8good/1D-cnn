@@ -12,7 +12,17 @@ class FullSpectrumAIEngine:
         if models_dir is None:
             models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models'))
 
-        self.models_dir = models_dir
+        self.models_dir = os.path.abspath(models_dir)
+        if os.path.basename(self.models_dir).lower() == "pretrained":
+            self.model_search_dirs = [
+                self.models_dir,
+                os.path.dirname(self.models_dir),
+            ]
+        else:
+            self.model_search_dirs = [
+                os.path.join(self.models_dir, "pretrained"),
+                self.models_dir,
+            ]
         self.predictor = None
         self.predictor_v2 = None
         self.generator = None
@@ -29,17 +39,30 @@ class FullSpectrumAIEngine:
         try:
             return torch.load(path, map_location=self.device, weights_only=True)
         except Exception:
-            return torch.load(path, map_location=self.device)
+            try:
+                return torch.load(path, map_location=self.device, weights_only=False)
+            except TypeError:
+                return torch.load(path, map_location=self.device)
+
+    def _resolve_artifact(self, file_name):
+        for model_dir in self.model_search_dirs:
+            p = os.path.join(model_dir, file_name)
+            if os.path.exists(p):
+                return p
+        return None
 
     def load_models(self):
         """Load trained model weights and normalization parameters."""
         try:
-            norm_path = os.path.join(self.models_dir, 'norm_params.pth')
-            pred_path = os.path.join(self.models_dir, 'spectral_predictor.pth')
-            gen_path = os.path.join(self.models_dir, 'spectral_generator.pth')
+            norm_path = self._resolve_artifact('norm_params.pth')
+            pred_path = self._resolve_artifact('spectral_predictor.pth')
+            gen_path = self._resolve_artifact('spectral_generator.pth')
 
-            if not os.path.exists(norm_path) or not os.path.exists(pred_path) or not os.path.exists(gen_path):
-                print('AI engine could not find pretrained weights under models/. Please run training first.')
+            if norm_path is None or pred_path is None or gen_path is None:
+                print(
+                    'AI engine could not find required artifacts '
+                    f'(searched: {self.model_search_dirs}). Please run training first.'
+                )
                 return False
 
             self.norm_params = self._load_torch_file(norm_path)
@@ -54,9 +77,9 @@ class FullSpectrumAIEngine:
             self.generator.eval()
 
             # Optional robust predictor v2.
-            pred_v2_path = os.path.join(self.models_dir, 'spectral_predictor_v2.pth')
-            v2_params_path = os.path.join(self.models_dir, 'predictor_v2_norm_params.pth')
-            if os.path.exists(pred_v2_path) and os.path.exists(v2_params_path):
+            pred_v2_path = self._resolve_artifact('spectral_predictor_v2.pth')
+            v2_params_path = self._resolve_artifact('predictor_v2_norm_params.pth')
+            if pred_v2_path is not None and v2_params_path is not None:
                 self.v2_norm_params = self._load_torch_file(v2_params_path)
                 v2_len = len(self.v2_norm_params['wavelengths'])
                 self.predictor_v2 = SpectralPredictorV2(seq_len=v2_len).to(self.device)
@@ -65,13 +88,16 @@ class FullSpectrumAIEngine:
                 self.v2_loaded = True
                 print('AI engine loaded robust predictor v2.')
 
-                cal_path = os.path.join(self.models_dir, 'predictor_v2_calibration.pth')
-                if os.path.exists(cal_path):
+                cal_path = self._resolve_artifact('predictor_v2_calibration.pth')
+                if cal_path is not None:
                     self.v2_calibration = self._load_torch_file(cal_path)
                     print('AI engine loaded predictor v2 calibration layer.')
 
             self.is_loaded = True
-            print('AI engine (predictor + generator) loaded successfully.')
+            print(
+                'AI engine (predictor + generator) loaded successfully '
+                f'from search dirs: {self.model_search_dirs}'
+            )
             return True
 
         except Exception as e:

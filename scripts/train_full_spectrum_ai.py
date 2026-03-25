@@ -23,9 +23,20 @@ def center_of_mass(spectra: torch.Tensor) -> torch.Tensor:
     return com.squeeze()
 
 
+def _prepare_model_dirs(project_root: str):
+    models_root = os.path.join(project_root, "models")
+    checkpoints_dir = os.path.join(models_root, "checkpoints")
+    pretrained_dir = os.path.join(models_root, "pretrained")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(pretrained_dir, exist_ok=True)
+    return models_root, checkpoints_dir, pretrained_dir
+
+
 def train() -> None:
     device = torch.device('cpu')
     print(f'Using device: {device}')
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    _models_root, checkpoints_dir, pretrained_dir = _prepare_model_dirs(root)
 
     data_path = os.path.abspath(
         os.path.join(
@@ -66,7 +77,12 @@ def train() -> None:
     )
 
     epochs = 150
+    checkpoint_interval = 10
     history = {'train_loss_p': [], 'train_loss_g': [], 'val_loss_p': [], 'val_loss_g': []}
+    best_val_joint = float("inf")
+    best_predictor_state = None
+    best_generator_state = None
+    best_epoch = 0
 
     print(f'Start training... epochs={epochs}')
     for epoch in range(epochs):
@@ -129,6 +145,38 @@ def train() -> None:
         scheduler_p.step(history['val_loss_p'][-1])
         scheduler_g.step(history['val_loss_g'][-1])
 
+        val_joint = history['val_loss_p'][-1] + history['val_loss_g'][-1]
+        if val_joint < best_val_joint:
+            best_val_joint = float(val_joint)
+            best_epoch = epoch + 1
+            best_predictor_state = {
+                k: v.detach().cpu().clone() for k, v in predictor.state_dict().items()
+            }
+            best_generator_state = {
+                k: v.detach().cpu().clone() for k, v in generator.state_dict().items()
+            }
+
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
+            checkpoint_path = os.path.join(
+                checkpoints_dir, f'full_spectrum_epoch_{epoch + 1:04d}.pth'
+            )
+            torch.save(
+                {
+                    'epoch': epoch + 1,
+                    'predictor_state_dict': predictor.state_dict(),
+                    'generator_state_dict': generator.state_dict(),
+                    'optimizer_p_state_dict': optimizer_p.state_dict(),
+                    'optimizer_g_state_dict': optimizer_g.state_dict(),
+                    'scheduler_p_state_dict': scheduler_p.state_dict(),
+                    'scheduler_g_state_dict': scheduler_g.state_dict(),
+                    'train_loss_p': epoch_loss_p,
+                    'train_loss_g': epoch_loss_g,
+                    'val_loss_p': history['val_loss_p'][-1],
+                    'val_loss_g': history['val_loss_g'][-1],
+                },
+                checkpoint_path,
+            )
+
         if (epoch + 1) % 10 == 0:
             print(
                 f"Epoch [{epoch + 1}/{epochs}] | "
@@ -136,19 +184,31 @@ def train() -> None:
                 f"Val(P): {history['val_loss_p'][-1]:.4f}, Val(G): {history['val_loss_g'][-1]:.4f}"
             )
 
-    model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models'))
-    os.makedirs(model_dir, exist_ok=True)
+    if best_predictor_state is not None and best_generator_state is not None:
+        predictor.load_state_dict(best_predictor_state)
+        generator.load_state_dict(best_generator_state)
+        best_ckpt_path = os.path.join(checkpoints_dir, "full_spectrum_best.pth")
+        torch.save(
+            {
+                "best_epoch": best_epoch,
+                "best_val_joint": best_val_joint,
+                "predictor_state_dict": best_predictor_state,
+                "generator_state_dict": best_generator_state,
+            },
+            best_ckpt_path,
+        )
 
-    torch.save(predictor.state_dict(), os.path.join(model_dir, 'spectral_predictor.pth'))
-    torch.save(generator.state_dict(), os.path.join(model_dir, 'spectral_generator.pth'))
+    torch.save(predictor.state_dict(), os.path.join(pretrained_dir, 'spectral_predictor.pth'))
+    torch.save(generator.state_dict(), os.path.join(pretrained_dir, 'spectral_generator.pth'))
 
     norm_params = {
         'spec_min': dataset.spec_min,
         'spec_max': dataset.spec_max,
         'wavelengths': dataset.wavelengths,
     }
-    torch.save(norm_params, os.path.join(model_dir, 'norm_params.pth'))
-    print('Saved models and normalization params to models/.')
+    torch.save(norm_params, os.path.join(pretrained_dir, 'norm_params.pth'))
+    print(f'Saved pretrained artifacts to: {pretrained_dir}')
+    print(f'Saved intermediate checkpoints to: {checkpoints_dir}')
 
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)

@@ -16,7 +16,21 @@ def _load_torch(path: str):
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
     except Exception:
-        return torch.load(path, map_location="cpu")
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
+
+def _resolve_artifact_path(models_root: str, file_name: str) -> str:
+    candidates = [
+        os.path.join(models_root, "pretrained", file_name),
+        os.path.join(models_root, file_name),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Missing artifact: {file_name} (searched: {candidates})")
 
 
 def parse_training_data(xlsx_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -61,14 +75,15 @@ def build_input_channels(specs: np.ndarray, params: Dict[str, np.ndarray]) -> np
 def main() -> None:
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     models_dir = os.path.join(root, "models")
+    checkpoints_dir = os.path.join(models_dir, "checkpoints")
+    pretrained_dir = os.path.join(models_dir, "pretrained")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(pretrained_dir, exist_ok=True)
     data_path = os.path.join(root, "data", "processed", "All_Absorbance_Spectra_Preprocessed.xlsx")
 
-    model_path = os.path.join(models_dir, "spectral_predictor_v2.pth")
-    norm_path = os.path.join(models_dir, "predictor_v2_norm_params.pth")
-    out_path = os.path.join(models_dir, "predictor_v2_calibration.pth")
-
-    if not os.path.exists(model_path) or not os.path.exists(norm_path):
-        raise FileNotFoundError("Missing predictor_v2 model or normalization params. Run train_concentration_v2.py first.")
+    model_path = _resolve_artifact_path(models_dir, "spectral_predictor_v2.pth")
+    norm_path = _resolve_artifact_path(models_dir, "predictor_v2_norm_params.pth")
+    out_path = os.path.join(pretrained_dir, "predictor_v2_calibration.pth")
 
     params = _load_torch(norm_path)
     specs, y_true_log, y_true_conc = parse_training_data(data_path)
@@ -99,6 +114,15 @@ def main() -> None:
     cal_x = iso.X_thresholds_.astype(np.float32)
     cal_y = iso.y_thresholds_.astype(np.float32)
     torch.save({"x_thresholds": cal_x, "y_thresholds": cal_y}, out_path)
+    torch.save(
+        {
+            "source_model": model_path,
+            "source_norm": norm_path,
+            "x_thresholds": cal_x,
+            "y_thresholds": cal_y,
+        },
+        os.path.join(checkpoints_dir, "predictor_v2_calibration_latest.pth"),
+    )
 
     pred_log_cal = np.interp(pred_log, cal_x, cal_y, left=cal_y[0], right=cal_y[-1])
     pred_conc_raw = np.maximum(0.0, (10 ** pred_log) - 1e-3)
@@ -109,6 +133,8 @@ def main() -> None:
     mae_raw = float(np.mean(np.abs(pred_conc_raw - y_true_conc)))
     mae_cal = float(np.mean(np.abs(pred_conc_cal - y_true_conc)))
 
+    print(f"Loaded predictor from: {model_path}")
+    print(f"Loaded norm params from: {norm_path}")
     print(f"Saved calibration: {out_path}")
     print(f"Train-set MAE raw -> cal:  {mae_raw:.6f} -> {mae_cal:.6f}")
     print(f"Train-set MAPE raw -> cal: {mape_raw:.6f}% -> {mape_cal:.6f}%")

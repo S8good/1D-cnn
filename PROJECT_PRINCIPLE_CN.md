@@ -19,7 +19,8 @@
 
 ## 2. 目录与关键文件
 
-- `run_gui.py`：PyQt 主界面，包含物理近似模型与 AI 功能入口。
+- `main.py`：应用统一启动入口（启动 GUI）。
+- `src/gui/main_window.py`：PyQt 主界面，包含物理近似模型与 AI 功能入口。
 - `src/core/ai_engine.py`：统一推理引擎（模型加载、浓度预测、光谱生成、spectrum-to-spectrum）。
 - `src/core/full_spectrum_models.py`：神经网络结构定义：
   - `SpectralPredictor`（v1）
@@ -98,7 +99,7 @@
 
 - 类型：Isotonic Regression（单调回归）
 - 作用：对 v2 输出的 log 浓度做单调映射校正
-- 文件：`models/predictor_v2_calibration.pth`
+- 文件：`models/pretrained/predictor_v2_calibration.pth`
 
 作用机理：
 
@@ -154,7 +155,7 @@
 
 ---
 
-## 6. GUI 行为解释（`run_gui.py`）
+## 6. GUI 行为解释（`src/gui/main_window.py`）
 
 ### 6.1 启动后的三条曲线
 
@@ -198,22 +199,25 @@ y_{aligned} = s \cdot y_{pred} + b
 
 训练并保存：
 
-1. `spectral_predictor.pth`（v1）
-2. `spectral_generator.pth`
-3. `norm_params.pth`
+1. `models/pretrained/spectral_predictor.pth`（v1）
+2. `models/pretrained/spectral_generator.pth`
+3. `models/pretrained/norm_params.pth`
+4. `models/checkpoints/full_spectrum_epoch_*.pth`（中间断点）
 
 ### 7.2 `scripts/train_concentration_v2.py`（新增）
 
 训练并保存：
 
-1. `spectral_predictor_v2.pth`
-2. `predictor_v2_norm_params.pth`
+1. `models/pretrained/spectral_predictor_v2.pth`
+2. `models/pretrained/predictor_v2_norm_params.pth`
+3. `models/checkpoints/predictor_v2_epoch_*.pth`（中间断点）
 
 ### 7.3 `scripts/fit_predictor_v2_calibration.py`（新增）
 
 拟合并保存：
 
-1. `predictor_v2_calibration.pth`
+1. `models/pretrained/predictor_v2_calibration.pth`
+2. `models/checkpoints/predictor_v2_calibration_latest.pth`（拟合记录）
 
 ---
 
@@ -281,7 +285,7 @@ y_{aligned} = s \cdot y_{pred} + b
 & 'C:/ProgramData/anaconda3/envs/gan/python.exe' scripts/evaluate_test_predict.py
 
 # 启动 GUI
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' run_gui.py
+& 'C:/ProgramData/anaconda3/envs/gan/python.exe' main.py
 ```
 
 ---
