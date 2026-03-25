@@ -1,7 +1,7 @@
+import argparse
 import os
 import re
 import sys
-import argparse
 from typing import Dict, Tuple
 
 import numpy as np
@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from src.core.full_spectrum_models import SpectralPredictorV2
+from src.core.full_spectrum_models import SpectralPredictor
 
 
 def _prepare_model_dirs(project_root: str):
@@ -55,7 +55,6 @@ def parse_training_data(data_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
             continue
         spec_valid = spec[valid]
         wl_valid = df["Wavelength"].values.astype(np.float32)[valid]
-
         if spec_valid.size != wl.size:
             spec_valid = np.interp(wl, wl_valid, spec_valid).astype(np.float32)
 
@@ -69,38 +68,18 @@ def parse_training_data(data_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def compute_robust_stats(train_specs: np.ndarray) -> Dict[str, np.ndarray]:
-    diff_specs = np.gradient(train_specs, axis=1)
-
     raw_med = np.median(train_specs, axis=0)
     raw_iqr = np.percentile(train_specs, 75, axis=0) - np.percentile(train_specs, 25, axis=0)
     raw_iqr = np.where(raw_iqr < 1e-6, 1.0, raw_iqr)
-
-    diff_med = np.median(diff_specs, axis=0)
-    diff_iqr = np.percentile(diff_specs, 75, axis=0) - np.percentile(diff_specs, 25, axis=0)
-    diff_iqr = np.where(diff_iqr < 1e-6, 1.0, diff_iqr)
-
     return {
         "raw_med": raw_med.astype(np.float32),
         "raw_iqr": raw_iqr.astype(np.float32),
-        "diff_med": diff_med.astype(np.float32),
-        "diff_iqr": diff_iqr.astype(np.float32),
     }
 
 
-def build_input_channels(specs: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    diff_specs = np.gradient(specs, axis=1)
+def build_input_channel(specs: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
     raw_norm = (specs - stats["raw_med"][None, :]) / (stats["raw_iqr"][None, :] + 1e-8)
-    diff_norm = (diff_specs - stats["diff_med"][None, :]) / (stats["diff_iqr"][None, :] + 1e-8)
-    x = np.stack([raw_norm, diff_norm], axis=1).astype(np.float32)  # [N, 2, L]
-    return x
-
-
-def monotonic_penalty(pred_logc: torch.Tensor, true_logc: torch.Tensor) -> torch.Tensor:
-    order = torch.argsort(true_logc.squeeze(1))
-    sorted_pred = pred_logc[order].squeeze(1)
-    # For monotonic increase, pred[i+1] - pred[i] should be >= 0.
-    violations = torch.relu(sorted_pred[:-1] - sorted_pred[1:])
-    return violations.mean()
+    return raw_norm[:, None, :].astype(np.float32)  # [N,1,L]
 
 
 def evaluate_regression(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> Dict[str, float]:
@@ -117,7 +96,6 @@ def evaluate_regression(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> Dict[
     sst = float(np.sum((y_true - np.mean(y_true)) ** 2))
     sse = float(np.sum((y_pred - y_true) ** 2))
     r2 = float(1.0 - sse / sst) if sst > 0 else float("nan")
-
     return {"mae_ng_ml": mae, "rmse_ng_ml": rmse, "mape_pct": mape, "r2": r2}
 
 
@@ -129,7 +107,7 @@ def set_seed(seed: int) -> None:
 def parse_args() -> argparse.Namespace:
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     default_split_dir = os.path.join(root, "data", "processed", "splits_reconstructed")
-    parser = argparse.ArgumentParser(description="Train SpectralPredictorV2 with explicit train/val/test splits.")
+    parser = argparse.ArgumentParser(description="Train SpectralPredictor(V1) with explicit train/val/test splits.")
     parser.add_argument(
         "--train",
         type=str,
@@ -182,9 +160,9 @@ def train() -> None:
     wavelengths = wavelengths_train
 
     stats = compute_robust_stats(specs_train)
-    x_train = build_input_channels(specs_train, stats)
-    x_val = build_input_channels(specs_val, stats)
-    x_test = build_input_channels(specs_test, stats)
+    x_train = build_input_channel(specs_train, stats)
+    x_val = build_input_channel(specs_val, stats)
+    x_test = build_input_channel(specs_test, stats)
 
     train_ds = TensorDataset(
         torch.from_numpy(x_train), torch.from_numpy(y_train.reshape(-1, 1).astype(np.float32))
@@ -199,19 +177,17 @@ def train() -> None:
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
 
-    model = SpectralPredictorV2(seq_len=x_train.shape[-1]).to(device)
-    criterion = nn.HuberLoss(delta=0.2)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=3e-4)
+    model = SpectralPredictor(seq_len=x_train.shape[-1]).to(device)
+    criterion = nn.HuberLoss(delta=0.3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
 
     best_val = float("inf")
     best_state = None
     best_epoch = 0
-    epochs = args.epochs
-    mono_weight = 0.15
     checkpoint_interval = 20
 
-    for epoch in range(epochs):
+    for epoch in range(args.epochs):
         model.train()
         train_losses = []
         for xb, yb in train_loader:
@@ -219,9 +195,7 @@ def train() -> None:
             yb = yb.to(device)
             optimizer.zero_grad()
             pred = model(xb)
-            loss_main = criterion(pred, yb)
-            loss_mono = monotonic_penalty(pred, yb)
-            loss = loss_main + mono_weight * loss_mono
+            loss = criterion(pred, yb)
             loss.backward()
             optimizer.step()
             train_losses.append(loss.item())
@@ -233,9 +207,7 @@ def train() -> None:
                 xb = xb.to(device)
                 yb = yb.to(device)
                 pred = model(xb)
-                loss_main = nn.functional.mse_loss(pred, yb)
-                loss_mono = monotonic_penalty(pred, yb)
-                val_losses.append((loss_main + mono_weight * loss_mono).item())
+                val_losses.append(nn.functional.mse_loss(pred, yb).item())
 
         mean_train = float(np.mean(train_losses))
         mean_val = float(np.mean(val_losses))
@@ -246,8 +218,8 @@ def train() -> None:
             best_epoch = epoch + 1
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
-            ckpt_path = os.path.join(checkpoints_dir, f"predictor_v2_epoch_{epoch + 1:04d}.pth")
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == args.epochs:
+            ckpt_path = os.path.join(checkpoints_dir, f"predictor_v1_epoch_{epoch + 1:04d}.pth")
             torch.save(
                 {
                     "epoch": epoch + 1,
@@ -266,13 +238,12 @@ def train() -> None:
 
         if (epoch + 1) % 20 == 0:
             print(
-                f"Epoch {epoch + 1:3d}/{epochs} | train={mean_train:.5f} | val={mean_val:.5f} | lr={optimizer.param_groups[0]['lr']:.2e}"
+                f"Epoch {epoch + 1:3d}/{args.epochs} | train={mean_train:.5f} | val={mean_val:.5f} | lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # Final evaluation on fixed test split.
     model.eval()
     preds_test = []
     true_test = []
@@ -286,7 +257,7 @@ def train() -> None:
     y_true_test = np.concatenate(true_test, axis=0)
     test_metrics = evaluate_regression(y_true_test, y_pred_test)
 
-    best_ckpt_path = os.path.join(checkpoints_dir, "predictor_v2_best.pth")
+    best_ckpt_path = os.path.join(checkpoints_dir, "predictor_v1_best.pth")
     if best_state is not None:
         torch.save(
             {
@@ -299,27 +270,24 @@ def train() -> None:
             best_ckpt_path,
         )
 
-    model_path = os.path.join(pretrained_dir, "spectral_predictor_v2.pth")
-    params_path = os.path.join(pretrained_dir, "predictor_v2_norm_params.pth")
+    model_path = os.path.join(pretrained_dir, "spectral_predictor_v1_split.pth")
+    params_path = os.path.join(pretrained_dir, "predictor_v1_norm_params.pth")
     torch.save(model.state_dict(), model_path)
     torch.save(
         {
             "raw_med": stats["raw_med"],
             "raw_iqr": stats["raw_iqr"],
-            "diff_med": stats["diff_med"],
-            "diff_iqr": stats["diff_iqr"],
             "wavelengths": wavelengths.astype(np.float32),
         },
         params_path,
     )
     print(f"Saved: {model_path}")
     print(f"Saved: {params_path}")
-    print(f"Saved checkpoints under: {checkpoints_dir}")
 
     out_dir = os.path.join(root, "outputs")
     os.makedirs(out_dir, exist_ok=True)
-    metrics_path = os.path.join(out_dir, "split_test_metrics_predictor_v2.csv")
-    detail_path = os.path.join(out_dir, "split_test_predictions_predictor_v2.csv")
+    metrics_path = os.path.join(out_dir, "split_test_metrics_predictor_v1.csv")
+    detail_path = os.path.join(out_dir, "split_test_predictions_predictor_v1.csv")
 
     pd.DataFrame(
         [

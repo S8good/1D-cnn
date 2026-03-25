@@ -1,299 +1,287 @@
-﻿# LSPR_Spectra_Master 原理详解
+﻿# LSPR_Spectra_Master 原理详解（按当前代码实现）
 
-本文档介绍 `DeepLearning/LSPR_Spectra_Master` 的核心原理、代码结构、数据流、训练与推理机制，以及当前版本（含 v2 + 校准 + 强度对齐）的实际行为。
+本文档基于当前仓库代码（`DeepLearning/LSPR_Spectra_Master`）给出一份可直接用于研发对齐的架构说明，覆盖系统目标、模块边界、训练与推理流程、模型工件、评估口径和已知限制。
 
-## 1. 项目目标
+## 1. 项目目标与业务定义
 
-项目目标是围绕 LSPR 光谱做一个“数字孪生”系统，支持两类能力：
+项目目标是建立 CEA 等生物标志物浓度与 LSPR 吸收光谱之间的双向映射能力，并在 GUI 中提供“物理可解释 + AI 可泛化”的联动展示。
 
-1. 正向：给定浓度，生成对应的光谱（`concentration -> spectrum`）。
-2. 逆向：给定测得光谱，反推浓度（`spectrum -> concentration`）。
+当前系统支持三类业务场景：
 
-在 GUI 中，这两类能力被组合成：
+1. 正向模拟（`Concentration -> Spectrum`）  
+输入目标浓度，输出一条预期反应后光谱。该输出可来自物理残差重建结果，也可来自 AI 生成器。
+2. 逆向反演（`Spectrum -> Concentration`）  
+输入实测光谱，输出浓度估计值（含线性定量区间与超量程分档解释）。
+3. 链式映射（`Spectrum -> Concentration -> Spectrum`）  
+输入实测光谱，先反演浓度，再基于该浓度生成对应光谱，并与输入谱做同轴对比。
 
-1. 滑块模拟（物理模型 + AI生成器）
-2. 导入光谱后反演浓度
-3. 导入光谱后预测光谱（链式：先反演浓度，再用生成器生成）
+说明：
 
----
+1. 本项目的 `Spectrum -> Spectrum` 不是端到端模型，而是链式组合。
+2. 当前代码不存在 GAN 判别器训练，光谱生成器是监督回归生成器。
 
-## 2. 目录与关键文件
+## 2. 系统分层架构
 
-- `main.py`：应用统一启动入口（启动 GUI）。
-- `src/gui/main_window.py`：PyQt 主界面，包含物理近似模型与 AI 功能入口。
-- `src/core/ai_engine.py`：统一推理引擎（模型加载、浓度预测、光谱生成、spectrum-to-spectrum）。
-- `src/core/full_spectrum_models.py`：神经网络结构定义：
-  - `SpectralPredictor`（v1）
-  - `SpectrumGenerator`
-  - `SpectralPredictorV2`（新增稳健版本）
-- `src/core/dataset.py`：全光谱训练数据集读取与归一化。
-- `scripts/train_full_spectrum_ai.py`：训练 v1 预测器 + 生成器。
-- `scripts/train_concentration_v2.py`：训练 v2 浓度回归器（新增）。
-- `scripts/fit_predictor_v2_calibration.py`：拟合 v2 的后处理单调校准层（新增）。
-- `scripts/evaluate_test_predict.py`：统一评估脚本（MAE/MAPE/R2/Bland-Altman 等）。
+系统可以拆成 4 层。
 
----
+1. 表现层（GUI）  
+`main.py` 启动 `src/gui/main_window.py`，负责交互、绘图、文件导入、消息提示。
+2. 应用服务层  
+`src/core/digital_twin_service.py` 负责编排物理引擎与 AI 引擎，向 GUI 返回统一结构化结果。
+3. 核心引擎层  
+`src/core/reconstruction.py` 提供物理残差引擎；`src/core/ai_engine.py` 提供统一 AI 推理引擎。
+4. 模型与算法层  
+`src/core/full_spectrum_models.py` 与 `src/core/neural_network.py` 定义神经网络；`src/core/physics_models.py` 定义 Lorentz/特征提取/强度对齐等函数。
 
-## 3. 数据与标签约定
+## 3. 关键模块职责
 
-核心训练数据来自：
+### 3.1 GUI 层
 
-- `data/processed/All_Absorbance_Spectra_Preprocessed.xlsx`
+入口是 `main.py`，不是 `run_gui.py`。  
+`LSPRDigitalTwinMainWindow` 提供三个主交互：
 
-要求：
+1. 浓度滑块驱动实时模拟曲线刷新。
+2. 导入光谱执行浓度反演。
+3. 导入光谱执行链式 spec2spec 预测。
 
-1. 第一列为 `Wavelength`。
-2. 光谱列名包含浓度信息，格式可被正则提取，例如：`0.5ng/ml-Ag-01_01`。
-3. `Ag` 列用于训练 AI 全光谱模型（逆向与生成器）。
+默认绘图叠加 2 到 3 条曲线：
 
-浓度标签在深度学习内部一般使用：
+1. BSA 基线谱（物理重建）。
+2. 反应后物理谱（物理重建）。
+3. AI 生成谱（可进行强度对齐后显示）。
 
-\[
-\log_{10}(c + 10^{-3})
-\]
+### 3.2 应用服务层（`DigitalTwinService`）
 
-这样可减轻浓度跨数量级时的回归难度。
+`DigitalTwinService` 的作用是屏蔽底层复杂性，对 GUI 提供稳定接口：
 
----
+1. `build_plot_context(concentration)`  
+同时调用物理残差引擎和 AI 生成器，返回 `PlotContext`。
+2. `infer_concentration_from_file(file_path)`  
+读取文件并调用 AI 引擎执行逆向反演。
+3. `predict_spectrum_from_file(file_path)`  
+读取文件并调用 AI 引擎执行链式 spec2spec。
 
-## 4. 模型体系（核心）
+### 3.3 物理残差引擎（`ResidualPhysicsEngine`）
 
-### 4.1 v1 浓度预测器 `SpectralPredictor`
+该引擎以“可解释特征变化”为中心，流程如下：
 
-- 输入：单通道归一化光谱 `[B,1,L]`
-- 主体：1D CNN + 池化 + 全连接
-- 输出：`log10(conc + 1e-3)`
+1. 从训练源提取 pre/post 光谱特征（峰位、峰强、FWHM）。
+2. 构造输入特征 `x=[log10(c+1e-3), lambda_pre, A_pre, fwhm_pre]`。
+3. 构造监督目标 `y=[delta_lambda, delta_A]`。
+4. 用 `StandardScaler` 对 `x/y` 标准化。
+5. 用 `LSPRResidualNet` 拟合残差映射。
+6. 预测时把 delta 叠加到基线特征，再调用 Lorentz 函数重建整条谱。
 
-特点：
+输出是 `ResidualPrediction`，含：
 
-1. 结构简单，训练快。
-2. 对噪声和基线漂移敏感。
-3. 依赖“单条光谱 min-max 归一化”，容易丢失绝对强度信息。
+1. `delta_lambda`
+2. `delta_amplitude`
+3. `peak_wavelength`
+4. `peak_intensity`
+5. `fwhm`
+
+### 3.4 统一 AI 引擎（`FullSpectrumAIEngine`）
+
+AI 引擎负责模型装载、输入适配、回退策略与业务解释输出。
+
+模型加载策略：
+
+1. 基础必需工件：`spectral_predictor.pth`、`spectral_generator.pth`、`norm_params.pth`。
+2. 可选增强工件：`spectral_predictor_v2.pth`、`predictor_v2_norm_params.pth`。
+3. 可选后处理工件：`predictor_v2_calibration.pth`。
+
+推理优先级：
+
+1. 优先走 v2。
+2. v2 失败时自动回退 v1。
+3. 若校准层存在，则在 v2 输出后执行单调校准。
+
+业务解释策略：
+
+1. 线性定量上限 `ULOQ=18.0 ng/ml`。
+2. `<=18` 返回定量值。
+3. `>18` 返回超量程分档（`18-40`、`40-75`、`>75`）。
+
+## 4. 深度学习模型定义
+
+### 4.1 v1 预测器 `SpectralPredictor`
+
+1D CNN 回归器，输入单通道光谱，输出 `log10(conc+1e-3)`。  
+适合基础场景，结构简单。
 
 ### 4.2 光谱生成器 `SpectrumGenerator`
 
-- 输入：浓度（log域，1维）
-- 主体：全连接展开 + 多级 Upsample + Conv1d
-- 输出：归一化光谱，再反归一化回真实量级
+输入 1 维浓度（log 域），经全连接升维后通过多级 `Upsample + Conv1d` 逐步还原成 1D 光谱。  
+输出经过 `Sigmoid`，再按 `spec_min/spec_max` 反归一化到真实强度范围。
 
-训练损失（`scripts/train_full_spectrum_ai.py`）：
+### 4.3 v2 预测器 `SpectralPredictorV2`
 
-1. 重建损失 `MSE(gen, real)`
-2. 质心约束（center-of-mass）损失，抑制峰位偏移失控
+双通道输入架构：
 
-### 4.3 v2 浓度预测器 `SpectralPredictorV2`（新增）
+1. 原始强度通道。
+2. 一阶导数通道。
 
-- 输入改为双通道 `[B,2,L]`：
-  1. 原始强度通道（robust 标准化）
-  2. 一阶导数通道（robust 标准化）
-- 主体：更深 1D CNN + GELU + Dropout
-- 训练增强：加入单调惩罚（monotonic penalty）
+训练端和推理端都使用 robust 统计量：
 
-目的：
+1. `median`
+2. `IQR`
 
-1. 保留绝对强度信息（解决 v1 对幅值不敏感）。
-2. 加强对谱形变化趋势的利用（导数通道）。
-3. 让浓度预测随真实浓度更单调、更稳定。
+激活使用 `GELU`，损失中额外加入单调惩罚项，约束浓度预测随真实浓度整体单调上升。
 
-### 4.4 v2 后处理校准层（新增）
+## 5. 训练流程与工件
 
-- 类型：Isotonic Regression（单调回归）
-- 作用：对 v2 输出的 log 浓度做单调映射校正
-- 文件：`models/pretrained/predictor_v2_calibration.pth`
+### 5.1 全光谱训练（v1 predictor + generator）
 
-作用机理：
+脚本：`scripts/train_full_spectrum_ai.py`
 
-1. 网络先给一个原始预测 `log_c_raw`。
-2. 用校准函数 `f(.)` 得到 `log_c_cal = f(log_c_raw)`。
-3. 再反变换到浓度域。
+训练内容：
 
-这一步可显著降低系统性偏差，特别是高浓度段。
+1. `SpectralPredictor` 用回归损失训练浓度反演。
+2. `SpectrumGenerator` 用重建损失训练光谱生成。
+3. 生成器额外使用质心损失（COM）抑制峰位漂移失控。
 
----
+主要产物：
 
-## 5. 推理流程（`ai_engine.py`）
-
-### 5.1 统一入口
-
-`FullSpectrumAIEngine` 在初始化时尝试加载：
-
-1. v1 predictor + generator + norm params（基础能力）
-2. v2 predictor + v2 norm params（可选增强）
-3. v2 calibration（可选后处理）
-
-优先级：
-
-1. 能用 v2 就用 v2
-2. v2 出错自动回退 v1
-
-### 5.2 逆向浓度预测 `predict_concentration`
-
-- v2 路径：
-  1. 光谱重采样到模型波长长度
-  2. 构建 raw + gradient 双通道
-  3. robust 标准化
-  4. v2 网络预测 `log_c`
-  5. 若有校准层则校准
-  6. 反变换得到浓度
-
-### 5.3 光谱生成 `generate_spectrum`
-
-1. 输入浓度转 log
-2. 送入生成器
-3. 用 `spec_min/spec_max` 反归一化
-4. 得到预测光谱
-
-### 5.4 光谱到光谱 `predict_spectrum_from_spectrum`
-
-注意这是**链式方法**，不是端到端映射：
-
-1. 输入光谱 -> 反演浓度
-2. 预测浓度 -> 生成器出光谱
-3. 对生成光谱做强度对齐（新增）：
-   - `pred_spectrum_raw`：原始生成器输出
-   - `pred_spectrum`：对齐后的输出
-
----
-
-## 6. GUI 行为解释（`src/gui/main_window.py`）
-
-### 6.1 启动后的三条曲线
-
-默认启动会执行 `update_plot(5.0)`，显示：
-
-1. 灰线：BSA 基线（Lorentz 重建）
-2. 红虚线：物理公式的 post 光谱（同样是 Lorentz）
-3. 紫线：AI 生成器光谱
-
-当前版本中，紫线在显示前会做一次“分位数强度对齐”（新增），减少峰高量级不一致。
-
-### 6.2 你之前看到峰高差距很大的原因
-
-历史版本里：
-
-1. 首屏紫线是生成器原始输出
-2. 没和物理曲线做幅值尺度对齐
-
-所以会出现“峰形像，但峰高量级差很大”的现象。
-
-### 6.3 当前强度对齐方法
-
-显示层使用稳健线性标定：
-
-\[
-y_{aligned} = s \cdot y_{pred} + b
-\]
-
-其中：
-
-1. `s` 用 P90-P10 动态范围比值得到
-2. `b` 用 P50（中位强度）对齐得到
-
-这不是“只对齐峰值”，而是对整个强度分布做对齐。
-
----
-
-## 7. 训练脚本职责划分
-
-### 7.1 `scripts/train_full_spectrum_ai.py`
-
-训练并保存：
-
-1. `models/pretrained/spectral_predictor.pth`（v1）
+1. `models/pretrained/spectral_predictor.pth`
 2. `models/pretrained/spectral_generator.pth`
 3. `models/pretrained/norm_params.pth`
-4. `models/checkpoints/full_spectrum_epoch_*.pth`（中间断点）
+4. `models/checkpoints/full_spectrum_epoch_*.pth`
 
-### 7.2 `scripts/train_concentration_v2.py`（新增）
+### 5.2 v2 浓度模型训练
 
-训练并保存：
+脚本：`scripts/train_concentration_v2.py`
+
+关键机制：
+
+1. 由训练集估计 `raw_med/raw_iqr/diff_med/diff_iqr`。
+2. 构建双通道输入并训练 `SpectralPredictorV2`。
+3. 主损失为 `HuberLoss`，叠加 `monotonic_penalty`。
+
+主要产物：
 
 1. `models/pretrained/spectral_predictor_v2.pth`
 2. `models/pretrained/predictor_v2_norm_params.pth`
-3. `models/checkpoints/predictor_v2_epoch_*.pth`（中间断点）
+3. `models/checkpoints/predictor_v2_epoch_*.pth`
+4. `models/checkpoints/predictor_v2_best.pth`
 
-### 7.3 `scripts/fit_predictor_v2_calibration.py`（新增）
+### 5.3 v2 校准层拟合
 
-拟合并保存：
+脚本：`scripts/fit_predictor_v2_calibration.py`
+
+流程：
+
+1. 读取 v2 模型与 norm 参数。
+2. 在数据上得到 `pred_log` 与真实 `log_conc` 的锚点关系。
+3. 用 `IsotonicRegression` 拟合单调映射。
+4. 保存 `x_thresholds/y_thresholds`。
+
+主要产物：
 
 1. `models/pretrained/predictor_v2_calibration.pth`
-2. `models/checkpoints/predictor_v2_calibration_latest.pth`（拟合记录）
+2. `models/checkpoints/predictor_v2_calibration_latest.pth`
 
----
+## 6. 端到端推理数据流
 
-## 8. 评估体系（`scripts/evaluate_test_predict.py`）
+### 6.1 逆向反演（Spectrum -> Concentration）
 
-测试集目录：`data/test-predict`
+1. 读入光谱并转为 1D 数组。
+2. 若长度不一致则按目标波长轴线性重采样。
+3. 进入 v2 或 v1 分支进行 log 浓度预测。
+4. 做反对数变换得到 `ng/ml`。
+5. 应用 ULOQ 规则生成报告文本。
 
-输出：
+### 6.2 正向生成（Concentration -> Spectrum）
 
-1. `outputs/eval_test_predict/detail_metrics.csv`
-2. `outputs/eval_test_predict/segment_metrics.csv`
-3. `outputs/eval_test_predict/summary_report.txt`
-4. `outputs/eval_test_predict/bland_altman.png`
-5. `outputs/eval_test_predict/true_vs_pred.png`
+1. `c` 映射为 `log10(c+1e-3)`。
+2. 送入生成器得到归一化谱。
+3. 使用 `spec_min/spec_max` 反归一化。
 
-可评估指标：
+### 6.3 链式 spec2spec（Spectrum -> Concentration -> Spectrum）
 
-1. MAE / RMSE / MAPE / R2
-2. 分段误差（低中高浓度）
-3. 光谱 MAE / RMSE / 相关性
+1. 输入谱先反演浓度。
+2. 再按该浓度生成预测谱。
+3. 最后对预测谱执行稳健强度对齐：
+   使用输入谱与预测谱的 `P10/P50/P90` 估计线性 `scale + offset`。
+4. 返回原始预测谱、对齐后谱、浓度、报告模式等完整字段。
 
----
+## 7. 数据组织与切分策略
 
-## 9. 当前版本的关键改进（相对原始版）
+数据列名采用可解析格式，例如 `0.5ng/ml-Ag-01_07`。  
+`split_reconstructed_dataset.py` 按浓度分层（`stratify`）进行 pair 级切分，输出：
 
-1. 浓度反演：v1 -> v2（双通道 + robust 标准化 + 单调惩罚）
-2. 后处理：加入 isotonic 校准层
-3. 光谱形态显示：加入强度对齐，显著减少峰高失配
-4. 评估体系：新增标准化误差报表与图
+1. `train_preprocessed_pairs.*`
+2. `val_preprocessed_pairs.*`
+3. `test_preprocessed_pairs.*`
+4. `split_assignment.csv`
 
----
+该方式保证 train/val/test 在浓度分布上可比，降低偶然分布偏差。
 
-## 10. 已知局限与建议
+## 8. 评估脚本与指标口径
 
-### 10.1 已知局限
+脚本：`scripts/evaluate_test_predict.py`
 
-1. `spectrum -> spectrum` 仍是链式，不是端到端。
-2. 校准层目前基于现有数据拟合，需外部数据验证泛化。
-3. 部分中间浓度样本（如 10 ng/ml 附近）仍可能有个例偏差。
+默认读取 `data/test-predict`，输出：
 
-### 10.2 建议路线
+1. 逐样本明细（浓度误差与光谱误差）。
+2. 分浓度段统计表。
+3. 文本总结报告。
+4. Bland-Altman 图。
+5. True-vs-Pred 散点图。
 
-1. 加入独立验证集与批次外测试（不同天、不同设备）。
-2. 尝试端到端 spec2spec 模型并与链式方案 AB 对比。
-3. 在 GUI 增加“原始/对齐后光谱切换”开关，便于诊断。
-4. 将模型加载的 `torch.load` 兼容策略进一步规范（安全与兼容平衡）。
+主要指标：
 
----
+1. MAE
+2. RMSE
+3. MAPE
+4. R2
+5. 光谱 MAE/RMSE/相关系数
+
+## 9. 当前版本工程特性
+
+1. 双路线并行  
+物理残差路线和深度学习路线同时可用，便于解释与对照。
+2. 推理弹性  
+v2 可选增强并带自动回退，减少线上因单模型故障导致的不可用。
+3. 结果表达分层  
+不仅输出数值，还输出“定量/超量程”解释，贴近检验场景。
+4. 强度后对齐  
+spec2spec 与 GUI 叠图时显著减少峰高量级错配。
+
+## 10. 已知边界与后续建议
+
+当前边界：
+
+1. spec2spec 是链式，不是直接学习输入谱到输出谱的条件映射。
+2. v2 校准层当前由现有数据拟合，跨批次泛化能力需独立验证。
+3. 全光谱训练脚本与 v2 脚本采用了不同标准化范式，维护时需注意一致性。
+
+建议优先级：
+
+1. 建立外部批次验证集并固定版本化评估基线。
+2. 在 GUI 增加“原始预测谱/对齐谱”切换。
+3. 增加端到端 spec2spec 基线模型用于 A/B 对比。
+4. 整理数据预处理协议，统一各训练脚本归一化口径。
 
 ## 11. 常用命令
 
-在项目根目录执行：
-
 ```powershell
-# 训练 v1（预测器 + 生成器）
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' scripts/train_full_spectrum_ai.py
+# 训练 v1 predictor + generator
+python scripts/train_full_spectrum_ai.py
 
-# 训练 v2 浓度模型
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' scripts/train_concentration_v2.py
+# 训练 v2 predictor
+python scripts/train_concentration_v2.py
 
-# 拟合 v2 校准层
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' scripts/fit_predictor_v2_calibration.py
+# 拟合 v2 isotonic 校准层
+python scripts/fit_predictor_v2_calibration.py
 
 # 评估 test-predict
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' scripts/evaluate_test_predict.py
+python scripts/evaluate_test_predict.py
 
 # 启动 GUI
-& 'C:/ProgramData/anaconda3/envs/gan/python.exe' main.py
+python main.py
 ```
 
----
+## 12. 总结
 
-## 12. 一句话总结
-
-这个项目本质是“物理启发 + 深度学习”的混合数字孪生系统：
-
-- 物理模块负责可解释的峰位/峰强变化模拟；
-- 深度学习模块负责全光谱反演与生成；
-- 当前版本通过 v2 回归器、单调校准和强度对齐，把浓度预测稳定性和光谱峰高一致性都显著提升。
+本项目当前架构是“残差物理重建 + 深度学习反演/生成 + 工程化推理回退”的混合数字孪生方案。  
+其中 v2 双通道预测、isotonic 校准和强度对齐是稳定性提升的三项核心工程增量。
