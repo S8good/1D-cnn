@@ -162,6 +162,23 @@
 
 1. 成功训练并保存可用联合模型权重。
 
+阶段2最新结论更新（截至 2026-03-26）：
+
+1. 已完成 `3-seed` 成对实验（`seed=20260325, 20260331, 20260407`），统一配置为：
+   - `C+Cycle(regressor)`：`predictor_train_mode=regressor`，`w_cycle=0.005`，`generator_lr=5e-5`，`joint_epochs=60`。
+2. 结果汇总（mean ± std）：
+   - `Model C`：MAE `6.4808 ± 0.8631`，RMSE `13.2536 ± 2.3615`，MAPE `33.6853 ± 4.6550`，R2 `0.7595 ± 0.0833`
+   - `C+Cycle(regressor)`：MAE `6.5297 ± 0.9626`，RMSE `13.6224 ± 2.8297`，MAPE `33.7320 ± 5.0088`，R2 `0.7441 ± 0.1036`
+3. 阶段结论（论文/报告口径）：
+   - 引入 `Cycle` 后未带来稳定收益，当前阶段应先收口，不再继续围绕同一损失权重做小步调参。
+4. 下一步分流建议：
+   - 若下一步目标是论文或报告：采用上述结论，按“未获得稳定增益”如实汇报。
+   - 若下一步目标是继续攻关提升：应转向训练机制改造，不再磨现有 loss 权重；优先实现交替更新的 `P-step/G-step` 联合训练。
+5. 对应产物：
+   - `3-seed` 明细：`outputs/stage2_regressor_3seed_20260326_143033/paired_seed_metrics.csv`
+   - 汇总表：`outputs/stage2_regressor_3seed_20260326_143033/summary_mean_std_with_mape.csv`
+   - 独立对比图：`outputs/stage2_regressor_3seed_20260326_143033/compare_c_vs_c_cycle_3seed_summary.png`
+
 ---
 
 ## 阶段3：Hill 物理约束接入

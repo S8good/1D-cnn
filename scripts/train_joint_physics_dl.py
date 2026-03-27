@@ -2,7 +2,7 @@ import argparse
 import os
 import re
 import sys
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -150,6 +150,39 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def configure_predictor_trainability(
+    predictor: SpectralPredictorV2_Fusion,
+    train_mode: str,
+) -> List[nn.Parameter]:
+    for p in predictor.parameters():
+        p.requires_grad = False
+
+    if train_mode == "all":
+        for p in predictor.parameters():
+            p.requires_grad = True
+    elif train_mode == "tail":
+        # Keep low-level spectral feature extractor fixed and tune fusion tail.
+        for module in (predictor.spectral_head, predictor.physics_encoder, predictor.regressor):
+            for p in module.parameters():
+                p.requires_grad = True
+    elif train_mode == "regressor":
+        for p in predictor.regressor.parameters():
+            p.requires_grad = True
+    elif train_mode == "frozen":
+        pass
+    else:
+        raise ValueError(f"Unsupported predictor train mode: {train_mode}")
+
+    return [p for p in predictor.parameters() if p.requires_grad]
+
+
+def set_frozen_submodules_eval(module: nn.Module) -> None:
+    for sub in module.modules():
+        own_params = list(sub.parameters(recurse=False))
+        if own_params and not any(p.requires_grad for p in own_params):
+            sub.eval()
+
+
 def parse_args() -> argparse.Namespace:
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     split_dir = os.path.join(root, "data", "processed", "splits_reconstructed")
@@ -184,6 +217,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictor-lr", type=float, default=2e-4)
     parser.add_argument("--generator-lr", type=float, default=1e-3)
     parser.add_argument("--freeze-predictor", action="store_true")
+    parser.add_argument(
+        "--predictor-train-mode",
+        type=str,
+        default="all",
+        choices=["all", "tail", "regressor", "frozen"],
+        help="Predictor finetune scope during joint phase. Ignored when --freeze-predictor is set.",
+    )
     parser.add_argument("--w-conc", type=float, default=1.0)
     parser.add_argument("--w-cycle", type=float, default=0.1)
     parser.add_argument("--w-mono", type=float, default=0.05)
@@ -314,14 +354,18 @@ def main() -> None:
             if (ep + 1) % 10 == 0:
                 print(f"Pretrain-Gen {ep + 1:3d}/{args.pretrain_gen_epochs} | loss={float(np.mean(loss_ep)):.5f}")
 
-    if args.freeze_predictor:
-        for p in predictor.parameters():
-            p.requires_grad = False
-        print("Predictor is frozen during joint phase.")
+    predictor_train_mode = "frozen" if args.freeze_predictor else args.predictor_train_mode
+    trainable_predictor_params = configure_predictor_trainability(predictor, predictor_train_mode)
+    predictor_trainable_count = int(sum(p.numel() for p in trainable_predictor_params))
+    predictor_total_count = int(sum(p.numel() for p in predictor.parameters()))
+    print(
+        f"Predictor train mode: {predictor_train_mode} | "
+        f"trainable_params={predictor_trainable_count}/{predictor_total_count}"
+    )
 
     optim_groups = []
-    if not args.freeze_predictor:
-        optim_groups.append({"params": predictor.parameters(), "lr": float(args.predictor_lr)})
+    if trainable_predictor_params:
+        optim_groups.append({"params": trainable_predictor_params, "lr": float(args.predictor_lr)})
     optim_groups.append({"params": generator.parameters(), "lr": float(args.generator_lr)})
     optimizer = optim.AdamW(optim_groups, weight_decay=3e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
@@ -331,10 +375,13 @@ def main() -> None:
     best_val = float("inf")
     best_state = None
     for epoch in range(args.joint_epochs):
-        if args.freeze_predictor:
+        if not trainable_predictor_params:
             predictor.eval()
         else:
             predictor.train()
+            if predictor_train_mode != "all":
+                # Keep frozen branches in eval mode to avoid BN/Dropout drift.
+                set_frozen_submodules_eval(predictor)
         generator.train()
         losses = []
         for xb, pb, yb, rb in train_loader:
@@ -407,6 +454,8 @@ def main() -> None:
                 "w_mono": float(args.w_mono),
                 "w_recon": float(args.w_recon),
             },
+            "predictor_train_mode": str(predictor_train_mode),
+            "predictor_trainable_params": int(predictor_trainable_count),
         },
         ckpt_out,
     )
@@ -431,6 +480,8 @@ def main() -> None:
                 "predictor_lr": float(args.predictor_lr),
                 "generator_lr": float(args.generator_lr),
                 "freeze_predictor": bool(args.freeze_predictor),
+                "predictor_train_mode": str(predictor_train_mode),
+                "predictor_trainable_params": int(predictor_trainable_count),
                 "w_conc": float(args.w_conc),
                 "w_cycle": float(args.w_cycle),
                 "w_mono": float(args.w_mono),
