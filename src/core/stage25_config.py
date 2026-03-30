@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class Stage25Profile:
 
 @dataclass(frozen=True)
 class Stage3GateDecision:
-    route: str | None
+    route: Optional[str]
     can_enter_stage3: bool
     narrative: str
     reason: str
