@@ -1,228 +1,228 @@
-# Stage 2.5 Alternating Joint Training Design
+# 阶段2.5 交替联合训练设计
 
-## Context
+## 背景
 
-The current Stage 2 joint-training entrypoint is [`scripts/train_joint_physics_dl.py`](C:/Users/Spc/Desktop/3.LSPR-code/LSPR_code/DeepLearning/LSPR_Spectra_Master/scripts/train_joint_physics_dl.py). It updates `SpectralPredictorV2_Fusion` and `SpectrumGenerator` with a single optimizer and a single backward pass over `L_conc + L_cycle + L_mono + L_recon`.
+当前阶段2的联合训练入口是 [`scripts/train_joint_physics_dl.py`](C:/Users/Spc/Desktop/3.LSPR-code/LSPR_code/DeepLearning/LSPR_Spectra_Master/scripts/train_joint_physics_dl.py)。该脚本使用单个优化器，并对 `L_conc + L_cycle + L_mono + L_recon` 做一次联合反向传播，同时更新 `SpectralPredictorV2_Fusion` 与 `SpectrumGenerator`。
 
-Documented Stage 2 results as of March 26, 2026 show that `C+Cycle(regressor)` did not produce stable gains over `Model C` across three seeds. The project goal for the next step is therefore not to continue minor weight tuning on the same synchronized update scheme, but to insert a mandatory Stage 2.5 gate that tests whether alternating updates can recover performance, reduce interference between predictor and generator, and provide a stable base for later `L_hill` integration.
+文档记录的阶段2结果显示，截至 2026 年 3 月 26 日，`C+Cycle(regressor)` 在三个随机种子上的表现并未稳定优于 `Model C`。因此，下一步不应继续围绕同一种同步更新机制做小范围损失权重微调，而应插入一个强制性的阶段2.5，用来检验交替更新是否能够恢复性能、降低 Predictor 与 Generator 之间的相互干扰，并为后续接入 `L_hill` 提供更稳定的训练主干。
 
-## Problem Statement
+## 问题定义
 
-The synchronized Stage 2 update scheme couples two different objectives too tightly:
+当前阶段2的同步更新方式，将两个性质不同的优化目标耦合得过紧：
 
-- The predictor must preserve `Model C` regression quality on real spectra.
-- The generator must learn a concentration-to-spectrum mapping useful for `L_cycle`.
-- The shared backward pass allows cycle and reconstruction gradients to perturb the predictor even when those gradients do not improve the main regression task.
+- Predictor 需要尽量保持 `Model C` 在真实光谱上的浓度回归能力。
+- Generator 需要学习一个对 `L_cycle` 有用的“浓度到光谱”映射。
+- 共享一次反向传播，会让 cycle 与 reconstruction 的梯度在并未改善主任务时仍然扰动 Predictor。
 
-Without a cleaner optimization structure, adding `L_hill` in Stage 3 would stack a second uncertain constraint on top of an already unstable training backbone. That would make failure analysis ambiguous and reduce the value of later ablation evidence.
+如果在这种尚未理顺的优化结构上继续叠加阶段3的 `L_hill`，就相当于在不稳定训练主干上再增加一个不确定约束。这样做会让失败原因变得模糊，也会削弱后续消融实验的说服力。
 
-## Success Criteria
+## 成功判据
 
-Stage 2.5 exists to answer one question before Stage 3 starts:
+阶段2.5存在的核心目的，是在进入阶段3之前回答一个明确问题：
 
-Can the project obtain a joint-training backbone with alternating updates such that cycle-based learning is at least non-destructive to the main regression task and stable enough to support Hill loss integration?
+能否通过交替更新得到一个联合训练主干，使得 Cycle 学习至少不会破坏主回归任务，并且整体足够稳定，能够支撑后续 `L_hill` 的接入？
 
-Primary success metrics are overall regression metrics:
+阶段2.5的主判据优先看总体回归指标：
 
 - `MAE`
 - `RMSE`
 - `R2`
 
-Secondary metrics are used as supporting evidence, not as first-pass decision makers:
+以下指标作为辅助证据，而不是第一决策层：
 
-- low-concentration error
-- high-concentration error
-- monotonicity violation rate
-- run-to-run variance
-- training success rate
+- 低浓度段误差
+- 高浓度段误差
+- 单调违例率
+- 多次重复实验方差
+- 训练成功率
 
-## Approaches Considered
+## 备选方案
 
-### Approach 1: Keep the current synchronized update and continue weight tuning
+### 方案1：保持现有同步更新，仅继续调损失权重
 
-This is the lowest-effort option, but it is not recommended. Stage 2 already produced a negative result under the current optimization pattern. More weight sweeps would generate cost without changing the failure mode.
+这是成本最低的方案，但不推荐。阶段2已经在当前优化范式下得到负结论，再继续做权重扫参，只会增加实验成本，而不会改变失败机制本身。
 
-### Approach 2: Replace Stage 2 with a single balanced alternating-update version
+### 方案2：直接用一个“平衡版”交替更新替换阶段2
 
-This is simpler to document, but it hides the escalation and fallback logic. If the first alternating-update configuration fails, the project would still need an implicit downgrade path.
+这种写法更简洁，但会把升级与回退逻辑隐藏起来。如果第一版交替更新仍然失败，文档里就缺少清晰的降级路径。
 
-### Approach 3: Add a funnel-style Stage 2.5 with explicit downgrade levels
+### 方案3：新增漏斗式阶段2.5，并显式定义降级层级
 
-This is the recommended approach. Stage 2.5 becomes a mandatory gate between Stage 2 and Stage 3 and is internally decomposed into:
+这是推荐方案。阶段2.5作为阶段2与阶段3之间的强制闸门，并在内部拆成：
 
-- `Stage 2.5A` aggressive
-- `Stage 2.5B` balanced
-- `Stage 2.5C` conservative
+- `阶段2.5A` 激进版
+- `阶段2.5B` 平衡版
+- `阶段2.5C` 保守版
 
-The team starts at the highest-upside configuration and only relaxes ambition when the evidence says it is necessary. This keeps the optimization effort disciplined and makes the decision to enter Stage 3 auditable.
+团队先从收益上限最高的配置开始尝试，只有在证据显示不可行时才逐级降级。这样既能约束优化方向，也能让“是否进入阶段3”的决策变得可审计。
 
-## Recommended Design
+## 推荐设计
 
-### 1. Stage graph change
+### 1. 阶段流程调整
 
-The project phase order changes from:
+项目阶段顺序从：
 
-`Stage 0 -> Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 -> Stage 5`
+`阶段0 -> 阶段1 -> 阶段2 -> 阶段3 -> 阶段4 -> 阶段5`
 
-to:
+调整为：
 
-`Stage 0 -> Stage 1 -> Stage 2 -> Stage 2.5 -> Stage 3 -> Stage 4 -> Stage 5`
+`阶段0 -> 阶段1 -> 阶段2 -> 阶段2.5 -> 阶段3 -> 阶段4 -> 阶段5`
 
-Stage 2 remains the synchronized-update baseline and negative reference. Stage 2.5 is the optimization-repair gate.
+其中，阶段2保留为“同步更新基线”和负参考；阶段2.5作为“优化修复闸门”。
 
-### 2. Stage 2.5 objective
+### 2. 阶段2.5的目标
 
-Stage 2.5 will redesign the joint optimization logic around alternating `P-step` and `G-step` updates.
+阶段2.5的核心工作，是把联合训练逻辑改造成交替的 `P-step` 与 `G-step` 更新。
 
-The design intent is:
+设计意图如下：
 
-- Predictor updates should stay dominated by real-spectrum concentration supervision.
-- Generator updates should improve synthetic-spectrum usability without destabilizing the predictor.
-- The joint path should become stable enough that adding `L_hill` in Stage 3 tests Hill supervision itself, not unresolved Stage 2 interference.
+- Predictor 的更新应继续由真实光谱上的浓度监督主导。
+- Generator 的更新应提升合成光谱对 Cycle 路径的可用性，同时不拖坏 Predictor。
+- 联合训练主干应稳定到这样的程度：阶段3接入 `L_hill` 时，主要在验证 Hill 约束本身，而不是继续暴露阶段2尚未解决的梯度干扰问题。
 
-### 3. Stage 2.5A, 2.5B, 2.5C ladder
+### 3. 阶段2.5A、2.5B、2.5C 梯度式推进
 
-#### Stage 2.5A: Aggressive
+#### 阶段2.5A：激进版
 
-Purpose: pursue an actual regression improvement over `Model C`.
+目的：争取在总体回归性能上真正超过 `Model C`。
 
-Allowed mechanisms:
+允许采用的机制：
 
-- alternating `P-step` and `G-step`
-- asymmetric learning rates
-- update frequency ratios such as `P:G = 1:1`, `2:1`, or `1:2`
-- staged unfreezing of predictor submodules
-- controlled reuse of `L_recon` and `L_cycle`
+- 交替 `P-step` 与 `G-step`
+- 非对称学习率
+- 更新频次比，例如 `P:G = 1:1`、`2:1`、`1:2`
+- Predictor 子模块的分阶段解冻
+- 对 `L_recon` 与 `L_cycle` 的受控复用
 
-Decision target:
+决策目标：
 
-- beat `Model C` on the primary metrics or produce a clearly positive tradeoff
+- 在主指标上击败 `Model C`，或至少形成明确的正向权衡
 
-#### Stage 2.5B: Balanced
+#### 阶段2.5B：平衡版
 
-Purpose: reduce optimization freedom and retain only the structures that improve stability.
+目的：减少优化自由度，只保留确实有助于稳定性的结构。
 
-Allowed mechanisms:
+允许采用的机制：
 
-- alternating `P-step` and `G-step`
-- limited predictor finetuning scope
-- a smaller hyperparameter search than 2.5A
+- 交替 `P-step` 与 `G-step`
+- 限制 Predictor 的可训练范围
+- 比 2.5A 更小的超参数搜索空间
 
-Decision target:
+决策目标：
 
-- keep overall regression essentially non-degraded while improving training stability and variance behavior
+- 在总体回归基本不退化的前提下，提高训练稳定性与结果方差表现
 
-#### Stage 2.5C: Conservative
+#### 阶段2.5C：保守版
 
-Purpose: prove that joint training can stay usable without materially harming the main task.
+目的：证明联合训练可以保持“可用”，而不会明显伤害主任务。
 
-Allowed mechanisms:
+允许采用的机制：
 
-- alternating updates
-- minimal predictor movement
-- generator kept usable for later `L_hill` attachment
+- 交替更新
+- 尽量小幅度地调整 Predictor
+- 保持 Generator 在后续接入 `L_hill` 时仍然可用
 
-Decision target:
+决策目标：
 
-- establish a clean and stable mother configuration for Stage 3 even if standalone cycle gain is weak
+- 即使 Cycle 单独收益较弱，也要建立一个干净、稳定、可继续接 Hill 的母体配置
 
-### 4. Entry criteria for Stage 3
+### 4. 进入阶段3的条件
 
-Stage 3 must not start immediately after any Stage 2.5 experiment. It only starts when one of the following conditions is satisfied.
+阶段3不能在任意一次阶段2.5实验结束后自动启动。只有满足以下路径之一，才允许进入阶段3。
 
-#### Route A: Strong entry from Stage 2.5A
+#### 路径A：来自阶段2.5A的强通过
 
-Across a three-seed paired comparison against `Model C` using the same split and the same seed set:
+在与 `Model C` 使用相同 split 和相同 seed 集合的 `3-seed` 成对实验中，满足以下条件：
 
-- either `MAE` or `RMSE` improves by at least `3%`, with `R2` no worse than `Model C - 0.01`
-- or `R2` improves by at least `0.02`, with both `MAE` and `RMSE` worsening by no more than `2%`
-- at least two of the three seeds have `MAE` no worse than their paired `Model C` runs
-- no unstable run behavior is observed, including divergence, unusable checkpoints, or generator collapse
+- `MAE` 或 `RMSE` 至少有一项相对 `Model C` 改善 `3%` 及以上，且 `R2` 不低于 `Model C - 0.01`
+- 或 `R2` 提升 `0.02` 及以上，且 `MAE`、`RMSE` 的劣化都不超过 `2%`
+- 三个 seed 中至少有两个 seed 的 `MAE` 不差于其对应的 `Model C`
+- 训练过程中没有明显不稳定现象，包括发散、不可用 checkpoint、Generator 塌陷
 
-If Route A is satisfied, Stage 3 uses the best Stage 2.5A configuration as the parent configuration for `L_hill`.
+若满足路径A，则阶段3直接以阶段2.5A的最优配置作为 `L_hill` 的母体配置。
 
-#### Route B: Acceptable entry from Stage 2.5B
+#### 路径B：来自阶段2.5B的可接受通过
 
-If Stage 2.5A fails to produce clear gains, Stage 2.5B may unlock Stage 3 when all of the following are true:
+如果阶段2.5A没有拿到明确增益，则阶段2.5B在同时满足以下条件时，可以放行阶段3：
 
-- `MAE` and `RMSE` each worsen by no more than `2%` relative to `Model C`
-- `R2` drops by no more than `0.01`
-- all three seeds converge successfully and produce usable weights
-- standard deviation is no worse than the synchronized Stage 2 baseline
+- `MAE` 与 `RMSE` 相对 `Model C` 的劣化都不超过 `2%`
+- `R2` 下降不超过 `0.01`
+- 三个 seed 全部成功收敛，并产出可用权重
+- 指标标准差不劣于当前阶段2同步更新基线
 
-If Route B is satisfied, Stage 3 is allowed, but the paper/report narrative must describe cycle as a stabilizing or enabling mechanism rather than an independently proven accuracy booster.
+若满足路径B，则允许进入阶段3，但论文或报告叙事中应把 Cycle 描述为“稳定化机制”或“为 Hill 提供训练主干的使能机制”，而不是单独证明了精度提升。
 
-#### Route C: Resource-limited entry from Stage 2.5C
+#### 路径C：资源受限前提下来自阶段2.5C的保守通过
 
-If 2.5A and 2.5B fail, Stage 2.5C can unlock Stage 3 only under a conservative interpretation:
+如果 2.5A 与 2.5B 都失败，则阶段2.5C 只有在更保守的解释下才可放行阶段3：
 
-- `MAE` and `RMSE` each worsen by no more than `5%` relative to `Model C`
-- `R2` drops by no more than `0.02`
-- training success rate is `100%`
-- generator outputs remain physically usable and do not show obvious spectral collapse
+- `MAE` 与 `RMSE` 相对 `Model C` 的劣化都不超过 `5%`
+- `R2` 下降不超过 `0.02`
+- 训练成功率为 `100%`
+- Generator 输出的谱形仍然物理上可用，没有明显塌陷
 
-If Route C is used, Stage 3 must be framed as a test of whether Hill loss improves physical consistency and extreme-range behavior, not as a guaranteed path to better overall regression.
+如果通过路径C进入阶段3，则阶段3的目标必须改写为：优先验证 Hill loss 是否改善物理一致性与极端浓度段表现，而不能预设其一定会提升总体回归指标。
 
-#### Blockers
+#### 阻断条件
 
-Stage 3 is blocked if any of the following remain true after Stage 2.5:
+若阶段2.5结束后仍存在以下任意情况，则禁止进入阶段3：
 
-- even Stage 2.5C shows clear overall regression degradation
-- run-to-run variance grows beyond the synchronized Stage 2 baseline
-- generator outputs collapse or become unusable for the cycle path
-- predictor main-task performance is visibly dragged down by the joint path
+- 即使是阶段2.5C，整体回归性能仍明显退化
+- 多 seed 方差继续恶化，超过同步更新阶段2基线
+- Generator 输出塌陷，Cycle 路径不可用
+- Predictor 主任务性能被联合训练明显拖坏
 
-### 5. Artifact retention and cleanup policy
+### 5. 产物保留与废文件清理规则
 
-Stage 2.5 is expected to generate many exploratory outputs. The cleanup rule is:
+预计阶段2.5会产生较多探索性输出，清理规则如下：
 
-Keep:
+保留：
 
-- best weights for each retained substage
-- three-seed summary tables
-- final comparison plots
-- minimal training logs needed to explain the decision
-- phase conclusions in markdown or csv form
+- 每个保留子阶段的最优权重
+- `3-seed` 汇总表
+- 最终对比图
+- 足以解释结论的最小必要训练日志
+- 阶段结论型 markdown 或 csv
 
-Delete:
+删除：
 
-- failed run checkpoints that are not referenced by any retained summary
-- duplicate intermediate exports from the same configuration
-- temporary figures generated only for quick inspection
-- temporary csv files used only for one-off debugging or tuning
-- cache-like artifacts such as `__pycache__`
+- 未被任何保留汇总引用的失败实验 checkpoint
+- 同一配置下重复导出的中间文件
+- 仅用于快速查看的临时图片
+- 仅用于一次性调参或排错的临时 csv
+- `__pycache__` 这类可再生缓存
 
-The cleanup process must preserve stage evidence. It should remove redundancy, not destroy the reasoning trail.
+清理过程必须保留阶段证据，删的是冗余，不是决策依据。
 
-### 6. Required updates to the main phase-plan document
+### 6. 主阶段计划文档需要同步修改的内容
 
-The project plan document [`docx/PROJECT_PHASE_PLAN_CN.md`](C:/Users/Spc/Desktop/3.LSPR-code/LSPR_code/DeepLearning/LSPR_Spectra_Master/docx/PROJECT_PHASE_PLAN_CN.md) will need these structural changes:
+项目主计划文档 [`docx/PROJECT_PHASE_PLAN_CN.md`](C:/Users/Spc/Desktop/3.LSPR-code/LSPR_code/DeepLearning/LSPR_Spectra_Master/docx/PROJECT_PHASE_PLAN_CN.md) 需要做以下结构调整：
 
-- insert `Stage 2.5` into the phase overview
-- add a full Stage 2.5 section with the 2.5A/2.5B/2.5C ladder
-- add explicit Stage 3 entry conditions
-- update risk and fallback language to include automatic downgrade from 2.5A to 2.5B to 2.5C
-- revise the weekly schedule so Stage 2.5 has its own execution window
-- revise milestone definitions so the stable alternating-update backbone becomes the new milestone before Hill integration
+- 在阶段总览中插入 `阶段2.5`
+- 新增完整的阶段2.5章节，并写清 2.5A / 2.5B / 2.5C 梯度推进逻辑
+- 给阶段3补充明确的进入条件
+- 在风险与回退部分增加从 2.5A 自动降级到 2.5B，再到 2.5C 的逻辑
+- 修改周节奏安排，使阶段2.5有独立执行窗口
+- 修改里程碑定义，把“稳定的交替更新联合训练主干”作为接入 Hill 前的新里程碑
 
-## Scope Boundaries
+## 范围边界
 
-This design does not yet specify exact code edits, exact command lines, or the final hyperparameter grid. Those belong in the implementation plan after this design is approved.
+本设计文档暂不规定具体代码修改、具体命令行或最终超参数网格。这些内容应在设计通过后写入 implementation plan。
 
-This design also does not declare that Stage 2.5 must succeed. It defines how success and failure are measured so that the team can stop guessing and make the Stage 3 decision on evidence.
+本设计文档也不预设阶段2.5一定成功。它的作用是把“成功”和“失败”的判定写清楚，避免团队继续依赖模糊感觉来决定是否进入阶段3。
 
-## Testing and Validation Expectations
+## 测试与验证预期
 
-When implementation starts, validation must be based on:
+正式实施时，验证必须基于以下约束：
 
-- fixed split files
-- fixed seed set for paired comparison
-- the same evaluation script family used for `Model C`
-- retained summary outputs that let the team compare `Model C`, Stage 2, and the final accepted Stage 2.5 configuration
+- 固定 split 文件
+- 固定 seed 集合做成对对比
+- 使用与 `Model C` 相同系列的评估脚本
+- 保留能够对比 `Model C`、阶段2同步更新基线以及最终被接受的阶段2.5配置的汇总输出
 
-## User-Approved Decisions Captured Here
+## 已确认的用户决策
 
-- Use a funnel-style Stage 2.5, not a single undifferentiated alternation stage.
-- Order of escalation is `aggressive -> balanced -> conservative`.
-- Overall regression metrics take priority over physical-consistency-only narratives at the Stage 2.5 gate.
-- Temporary waste files created during exploration should be cleaned up, while stage-level artifacts and decision evidence must be retained.
+- 阶段2.5采用漏斗式结构，而不是单一的交替训练阶段。
+- 推进顺序固定为 `激进 -> 平衡 -> 保守`。
+- 阶段2.5的主判据以总体回归指标优先，不以纯物理一致性叙事为先。
+- 探索过程中产生的废文件需要清理，但阶段性产物与决策证据必须保留。
