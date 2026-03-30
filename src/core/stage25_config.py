@@ -53,8 +53,12 @@ def apply_profile_overrides(args, profile: Stage25Profile):
 
 def _pct_worse(candidate: float, baseline: float) -> float:
     if baseline == 0:
-        return 0.0
+        return 0.0 if candidate == 0 else float("inf")
     return (candidate - baseline) / baseline
+
+
+def _route_a_win_threshold(seed_count: int) -> int:
+    return max(1, (seed_count + 1) // 2)
 
 
 def evaluate_stage3_gate(
@@ -75,7 +79,13 @@ def evaluate_stage3_gate(
     rmse_worse = _pct_worse(candidate["rmse_ng_ml"], baseline["rmse_ng_ml"])
     r2_drop = baseline["r2"] - candidate["r2"]
 
-    if ((mae_worse <= -0.03) or (rmse_worse <= -0.03)) and r2_drop <= 0.01 and paired_mae_wins >= 2:
+    route_a_win_threshold = _route_a_win_threshold(seed_count)
+
+    if (
+        ((mae_worse <= -0.03) or (rmse_worse <= -0.03))
+        and r2_drop <= 0.01
+        and paired_mae_wins >= route_a_win_threshold
+    ):
         return Stage3GateDecision("A", True, "可以进入阶段3", "2.5A 已取得明确总体收益。")
     if mae_worse <= 0.02 and rmse_worse <= 0.02 and r2_drop <= 0.01 and std_ratio <= 1.0:
         return Stage3GateDecision("B", True, "稳定进入阶段3", "2.5B 总体不退化且稳定性可接受。")
