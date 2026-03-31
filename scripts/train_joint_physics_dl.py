@@ -2,7 +2,7 @@ import argparse
 import os
 import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.core.full_spectrum_models import SpectralPredictorV2_Fusion, SpectrumGenerator
+from src.core.stage3_config import apply_stage3_profile_overrides, build_stage3_profile
+from src.core.stage3_hill import FixedHillCurve, LearnableHillCurve
+from src.core.stage3_training import run_stage3_alternating_epoch
 
 
 def _prepare_model_dirs(project_root: str):
@@ -31,6 +34,16 @@ def _load_table(path: str) -> pd.DataFrame:
     if ext in [".csv", ".txt"]:
         return pd.read_csv(path)
     raise ValueError(f"Unsupported file extension: {ext}")
+
+
+def _load_torch(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
 
 
 def load_bsa_feature_lookup(features_path: str) -> Dict[str, np.ndarray]:
@@ -127,6 +140,126 @@ def monotonic_penalty(pred_logc: torch.Tensor, true_logc: torch.Tensor) -> torch
     order = torch.argsort(true_logc.squeeze(1))
     sorted_pred = pred_logc[order].squeeze(1)
     return torch.relu(sorted_pred[:-1] - sorted_pred[1:]).mean()
+
+
+def predictor_step(
+    predictor: SpectralPredictorV2_Fusion,
+    batch,
+    predictor_optimizer,
+    mono_weight: float,
+):
+    xb, pb, yb, _rb = batch
+    predictor_optimizer.zero_grad()
+    pred_real = predictor(xb, pb)
+    loss_conc = nn.functional.huber_loss(pred_real, yb, delta=0.2)
+    loss_mono = monotonic_penalty(pred_real, yb)
+    loss = loss_conc + mono_weight * loss_mono
+    loss.backward()
+    predictor_optimizer.step()
+    return {
+        "loss_total": float(loss.detach().cpu().item()),
+        "loss_conc": float(loss_conc.detach().cpu().item()),
+        "loss_mono": float(loss_mono.detach().cpu().item()),
+    }
+
+
+def apply_stage3_profile(args, profile):
+    return apply_stage3_profile_overrides(args, profile)
+
+
+def build_output_tag(stage25_profile: Optional[str], stage3_profile: Optional[str] = "") -> str:
+    if stage3_profile:
+        return "stage3_" + stage3_profile.lower().replace("-", "_")
+    if stage25_profile:
+        return "stage25_" + stage25_profile.lower().replace(".", "p")
+    return "cycle"
+
+
+def build_hill_curve(args) -> Optional[nn.Module]:
+    if args.hill_mode == "off":
+        return None
+    params = _load_torch(os.path.abspath(args.hill_params_path))
+    if args.hill_mode == "fixed":
+        return FixedHillCurve(
+            delta_lambda_max=float(params["delta_lambda_max"]),
+            k_half=float(params["k_half"]),
+            hill_n=float(params["hill_n"]),
+        )
+    if args.hill_mode in {"learnable_kn", "learnable_all"}:
+        return LearnableHillCurve(
+            delta_lambda_max=float(params["delta_lambda_max"]),
+            k_half=float(params["k_half"]),
+            hill_n=float(params["hill_n"]),
+        )
+    raise ValueError(f"Unsupported hill mode: {args.hill_mode}")
+
+
+def run_joint_training_epoch(
+    predictor,
+    generator,
+    train_loader,
+    predictor_optimizer,
+    generator_optimizer,
+    update_strategy,
+    mono_weight,
+    cycle_weight,
+    recon_weight,
+    p_steps,
+    g_steps,
+    hill_weight,
+    stage3_runner=None,
+    hill_context=None,
+):
+    if hill_context and hill_context.get("enabled"):
+        return stage3_runner(
+            predictor=predictor,
+            generator=generator,
+            train_batches=train_loader,
+            wavelengths_nm=hill_context.get("wavelengths_nm"),
+            predictor_optimizer=predictor_optimizer,
+            generator_optimizer=generator_optimizer,
+            hill_curve=hill_context.get("hill_curve"),
+            p_steps=p_steps,
+            g_steps=g_steps,
+            mono_weight=mono_weight,
+            cycle_weight=cycle_weight,
+            recon_weight=recon_weight,
+            hill_weight=hill_weight,
+            hill_window_center_nm=hill_context.get("hill_window_center_nm"),
+            hill_window_half_width_nm=hill_context.get("hill_window_half_width_nm"),
+            hill_temperature=hill_context.get("hill_temperature"),
+            hill_reg_weight=hill_context.get("hill_reg_weight", 0.0),
+        )
+
+    losses = []
+    huber = nn.HuberLoss(delta=0.2)
+    mse = nn.MSELoss()
+    for xb, pb, yb, rb in train_loader:
+        predictor_optimizer.zero_grad()
+        generator_optimizer.zero_grad()
+        pred_real = predictor(xb, pb)
+        loss_conc = huber(pred_real, yb)
+
+        gen_raw = generator(yb).squeeze(1)
+        gen_diff = _tensor_gradient_1d(gen_raw)
+        x_gen = torch.stack([gen_raw, gen_diff], dim=1)
+        pred_cycle = predictor(x_gen, pb)
+        loss_cycle = mse(pred_cycle, yb)
+        loss_mono = monotonic_penalty(pred_real, yb)
+        loss_recon = mse(gen_raw, rb)
+        loss = loss_conc + cycle_weight * loss_cycle + mono_weight * loss_mono + recon_weight * loss_recon
+        loss.backward()
+        predictor_optimizer.step()
+        generator_optimizer.step()
+        losses.append(float(loss.detach().cpu().item()))
+
+    return {
+        "predictor_steps": 0,
+        "generator_steps": 0,
+        "predictor_loss": 0.0,
+        "generator_loss": float(np.mean(losses)) if losses else 0.0,
+        "generator_loss_hill": 0.0,
+    }
 
 
 def evaluate_regression(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> Dict[str, float]:
@@ -228,7 +361,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-cycle", type=float, default=0.1)
     parser.add_argument("--w-mono", type=float, default=0.05)
     parser.add_argument("--w-recon", type=float, default=0.05)
-    return parser.parse_args()
+    parser.add_argument(
+        "--stage3-profile",
+        type=str,
+        choices=["3A-fixed-frozen", "3B-fixed-regressor", "3C-learnable-regressor"],
+    )
+    parser.add_argument("--hill-mode", type=str, default="off", choices=["off", "fixed", "learnable_kn", "learnable_all"])
+    parser.add_argument(
+        "--hill-params-path",
+        type=str,
+        default=os.path.join(root, "models", "pretrained", "stage3_hill_params.pth"),
+    )
+    parser.add_argument("--w-hill", type=float, default=0.0)
+    parser.add_argument("--hill-reg-weight", type=float, default=0.0)
+    parser.add_argument("--hill-window-center-nm", type=float, default=603.0)
+    parser.add_argument("--hill-window-half-width-nm", type=float, default=15.0)
+    parser.add_argument("--hill-temperature", type=float, default=0.25)
+    args = parser.parse_args()
+    if args.stage3_profile:
+        apply_stage3_profile(args, build_stage3_profile(args.stage3_profile))
+    return args
 
 
 def _tensor_gradient_1d(x: torch.Tensor) -> torch.Tensor:
@@ -288,6 +440,7 @@ def main() -> None:
     specs_test, phy_test, y_test, wl_test = parse_training_data_fusion(test_path, bsa_lookup)
     if not (np.allclose(wl_train, wl_val) and np.allclose(wl_train, wl_test)):
         raise RuntimeError("Train/val/test wavelength grids are not identical.")
+    stage25_profile = "2.5C" if args.predictor_train_mode in {"frozen", "regressor"} else ""
 
     x_train = build_input_channels(specs_train, stats)
     x_val = build_input_channels(specs_val, stats)
@@ -368,9 +521,26 @@ def main() -> None:
         optim_groups.append({"params": trainable_predictor_params, "lr": float(args.predictor_lr)})
     optim_groups.append({"params": generator.parameters(), "lr": float(args.generator_lr)})
     optimizer = optim.AdamW(optim_groups, weight_decay=3e-4)
+    predictor_optimizer = optimizer if trainable_predictor_params else optim.AdamW(
+        [{"params": [torch.zeros(1, requires_grad=True)], "lr": float(args.predictor_lr)}]
+    )
+    generator_optimizer = optimizer
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
     huber = nn.HuberLoss(delta=0.2)
     mse = nn.MSELoss()
+
+    hill_curve = build_hill_curve(args)
+    if hill_curve is not None:
+        hill_curve = hill_curve.to(device)
+    hill_context = {
+        "enabled": hill_curve is not None and float(args.w_hill) > 0.0,
+        "hill_curve": hill_curve,
+        "wavelengths_nm": torch.from_numpy(wl_train.astype(np.float32)),
+        "hill_window_center_nm": float(args.hill_window_center_nm),
+        "hill_window_half_width_nm": float(args.hill_window_half_width_nm),
+        "hill_temperature": float(args.hill_temperature),
+        "hill_reg_weight": float(args.hill_reg_weight),
+    }
 
     best_val = float("inf")
     best_state = None
@@ -383,34 +553,25 @@ def main() -> None:
                 # Keep frozen branches in eval mode to avoid BN/Dropout drift.
                 set_frozen_submodules_eval(predictor)
         generator.train()
-        losses = []
-        for xb, pb, yb, rb in train_loader:
-            xb = xb.to(device)
-            pb = pb.to(device)
-            yb = yb.to(device)
-            rb = rb.to(device)
-
-            optimizer.zero_grad()
-            pred_real = predictor(xb, pb)
-            loss_conc = huber(pred_real, yb)
-
-            gen_raw = generator(yb).squeeze(1)
-            gen_diff = _tensor_gradient_1d(gen_raw)
-            x_gen = torch.stack([gen_raw, gen_diff], dim=1)
-            pred_cycle = predictor(x_gen, pb)
-            loss_cycle = mse(pred_cycle, yb)
-            loss_mono = monotonic_penalty(pred_real, yb)
-            loss_recon = mse(gen_raw, rb)
-
-            loss = (
-                args.w_conc * loss_conc
-                + args.w_cycle * loss_cycle
-                + args.w_mono * loss_mono
-                + args.w_recon * loss_recon
-            )
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
+        epoch_stats = run_joint_training_epoch(
+            predictor=predictor,
+            generator=generator,
+            train_loader=[
+                (xb.to(device), pb.to(device), yb.to(device), rb.to(device))
+                for xb, pb, yb, rb in train_loader
+            ],
+            predictor_optimizer=optimizer,
+            generator_optimizer=optimizer,
+            update_strategy="alternating" if hill_context["enabled"] else "joint",
+            mono_weight=float(args.w_mono),
+            cycle_weight=float(args.w_cycle),
+            recon_weight=float(args.w_recon),
+            p_steps=int(getattr(args, "p_steps", 1)),
+            g_steps=int(getattr(args, "g_steps", 1)),
+            hill_weight=float(args.w_hill),
+            stage3_runner=run_stage3_alternating_epoch,
+            hill_context=hill_context,
+        )
 
         val_loss, _, _ = evaluate_predictor(predictor, val_loader, device)
         scheduler.step(val_loss)
@@ -423,7 +584,7 @@ def main() -> None:
             }
         if (epoch + 1) % 20 == 0:
             print(
-                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={float(np.mean(losses)):.5f} | "
+                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={float(epoch_stats['generator_loss']):.5f} | "
                 f"val={val_loss:.5f} | lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -434,14 +595,15 @@ def main() -> None:
     _, y_true, y_pred = evaluate_predictor(predictor, test_loader, device)
     test_metrics = evaluate_regression(y_true, y_pred)
 
-    pred_out = os.path.join(pretrained_dir, "spectral_predictor_v2_cycle.pth")
-    gen_out = os.path.join(pretrained_dir, "spectral_generator_cycle.pth")
-    params_out = os.path.join(pretrained_dir, "predictor_v2_cycle_norm_params.pth")
+    output_tag = build_output_tag(stage25_profile=stage25_profile, stage3_profile=args.stage3_profile)
+    pred_out = os.path.join(pretrained_dir, f"spectral_predictor_v2_{output_tag}.pth")
+    gen_out = os.path.join(pretrained_dir, f"spectral_generator_{output_tag}.pth")
+    params_out = os.path.join(pretrained_dir, f"predictor_v2_{output_tag}_norm_params.pth")
     torch.save(predictor.state_dict(), pred_out)
     torch.save(generator.state_dict(), gen_out)
     torch.save(norm_params, params_out)
 
-    ckpt_out = os.path.join(checkpoints_dir, "joint_cycle_best.pth")
+    ckpt_out = os.path.join(checkpoints_dir, f"joint_{output_tag}_best.pth")
     torch.save(
         {
             "best_epoch": int(best_state["epoch"] if best_state else args.joint_epochs),
@@ -453,17 +615,20 @@ def main() -> None:
                 "w_cycle": float(args.w_cycle),
                 "w_mono": float(args.w_mono),
                 "w_recon": float(args.w_recon),
+                "w_hill": float(args.w_hill),
             },
             "predictor_train_mode": str(predictor_train_mode),
             "predictor_trainable_params": int(predictor_trainable_count),
+            "stage3_profile": str(args.stage3_profile or ""),
+            "hill_mode": str(args.hill_mode),
         },
         ckpt_out,
     )
 
     out_dir = os.path.join(root, "outputs")
     os.makedirs(out_dir, exist_ok=True)
-    metrics_path = os.path.join(out_dir, "split_test_metrics_predictor_v2_cycle.csv")
-    details_path = os.path.join(out_dir, "split_test_predictions_predictor_v2_cycle.csv")
+    metrics_path = os.path.join(out_dir, f"split_test_metrics_predictor_v2_{output_tag}.csv")
+    details_path = os.path.join(out_dir, f"split_test_predictions_predictor_v2_{output_tag}.csv")
     pd.DataFrame(
         [
             {
@@ -486,6 +651,9 @@ def main() -> None:
                 "w_cycle": float(args.w_cycle),
                 "w_mono": float(args.w_mono),
                 "w_recon": float(args.w_recon),
+                "w_hill": float(args.w_hill),
+                "stage3_profile": str(args.stage3_profile or ""),
+                "hill_mode": str(args.hill_mode),
                 **test_metrics,
             }
         ]

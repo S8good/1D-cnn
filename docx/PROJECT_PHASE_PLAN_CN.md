@@ -1,6 +1,6 @@
 ﻿# LSPR 论文与工程联合落地计划（阶段版）
 
-本文档用于指导 `LSPR_Spectra_Master` 从当前版本推进到可发表高水平 SCI/EI 交叉学科论文的完整实施路径。目标是把“特征融合注入（Fusion）+ PGDL（Hill + Cycle）”做成可复现、可解释、可对比的工程与论文一体化方案。
+本文档用于指导 `LSPR_Spectra_Master` 从当前版本推进到可发表高水平 SCI/EI 交叉学科论文的完整实施路径。目标是把“特征融合注入（Fusion）+ PGDL（Cycle + Hill）”做成可复现、可解释、可对比的工程与论文一体化方案，并在 Hill 接入前显式加入 `阶段2.5` 交替联合训练闸门。
 
 ## 1. 总体目标（终局）
 
@@ -11,16 +11,25 @@
 3. 形成论文所需核心图表：架构图、消融表、Bland-Altman、True-vs-Pred、物理一致性图、单调违例率表。
 4. 交付可复现实验脚本、固定数据切分、固定随机种子、可追溯模型工件。
 
+### 当前进度摘要（截至 2026-03-31）
+
+1. 阶段0、阶段1已完成，`Model C (V2_Fusion)` 相比 `Model B (V2)` 在 MAE/RMSE/R2 三项核心指标上已有明确提升。
+2. 阶段2已完成 `3-seed` 复核，结论是 `C+Cycle(regressor)` 未带来稳定收益，因此主线不再围绕同步更新版 `Cycle` 继续小步调参。
+3. 阶段2.5/阶段3的工程基础设施已落地：已实现 Hill 核心模块、Stage 3 配置、交替训练原语、训练入口集成、固定 Hill 参数拟合脚本与实验 runner。
+4. 已完成 `3A-fixed-frozen` 单 seed smoke run，测试指标为：MAE `6.5492`，RMSE `13.4009`，MAPE `36.068%`，R2 `0.7592`；对应快照目录为 `outputs/stage3_3a_fixed_frozen_seed20260325/`。
+5. 当前代码验证状态：Stage 3 相关自动化测试 `17 passed`，说明工程链路已经打通；但尚不能据此声称阶段3已在论文指标上优于 `Model C`，后续仍需继续做 `3A/3B/3C` 多 seed 对比与阶段4系统化消融。
+
 ## 2. 阶段拆解总览
 
 1. 阶段0：基线冻结与实验规范化（1-2天）
 2. 阶段1：特征融合改造（Fusion）（3-5天）
-3. 阶段2：联合训练框架（Cycle 先行）（4-6天）
-4. 阶段3：Hill 物理约束接入（4-6天）
-5. 阶段4：系统化消融实验（5-7天）
-6. 阶段5：可视化与论文打包（3-5天）
+3. 阶段2：联合训练框架（同步更新版 Cycle 基线）（4-6天）
+4. 阶段2.5：交替联合训练主干（Hill 前置闸门）（3-5天）
+5. 阶段3：Hill 物理约束接入（固定参数 -> 可学习参数）（4-6天）
+6. 阶段4：系统化消融实验（5-7天）
+7. 阶段5：可视化与论文打包（3-5天）
 
-建议总周期：4-6周（根据算力与调参轮次浮动）。
+建议总周期：5-7周（根据算力与调参轮次浮动）。
 
 ## 3. 各阶段详细计划
 
@@ -181,6 +190,42 @@
 
 ---
 
+## 阶段2.5：交替联合训练主干（Hill 前置闸门）
+
+目标：在接入 `L_hill` 之前，先把联合训练从“同步更新”改造成“交替更新”，把 Stage 3 建立在一个更稳定、可解释、可回退的训练主干上。
+
+任务：
+
+1. 将联合训练从单次共享反向传播改造成 `P-step / G-step` 交替更新。
+2. 显式控制 Predictor 可训练范围与更新频次，例如 `frozen / regressor / tail / all`。
+3. 预留 `p_steps / g_steps / hill_mode / hill_reg_weight` 等 Stage 3 需要的配置位。
+4. 形成保守可用的 `2.5C` 母体配置，作为 Stage 3 `3A/3B/3C` profile 的基础。
+
+预期目标：
+
+1. 联合训练主干稳定，不再因 `Cycle` 分支直接扰动 Predictor 主任务而出现不可控退化。
+2. 为后续 Stage 3 的 `fixed Hill` 与 `learnable Hill` 提供统一入口和可复现实验脚本。
+
+交付物：
+
+1. 交替训练入口与 profile 约束逻辑
+2. 可复现的 Stage 2.5/Stage 3 参数模板
+3. 可直接被 Stage 3 调用的训练原语
+
+验收标准：
+
+1. 至少能稳定支撑 `3A-fixed-frozen` 的 smoke run 闭环。
+2. 作为母体配置时，不引入新的训练崩溃点或不可恢复依赖。
+
+阶段2.5 / Stage 3 联动实现状态（截至 2026-03-31）：
+
+1. 已在代码中落地交替训练原语：`src/core/stage3_training.py` 提供 hill-aware generator step 与 alternating epoch runner。
+2. 已定义 `3A-fixed-frozen`、`3B-fixed-regressor`、`3C-learnable-regressor` 三个 Stage 3 profile，均以 `2.5C` 为母体配置。
+3. 当前 `3A-fixed-frozen` smoke run 已成功打通，说明 `2.5C` 风格主干已满足“可承载 Stage 3”的最小工程门槛。
+4. 但阶段2.5作为独立论文结论仍未完成多 seed 统计，因此当前只能说“主干已可用”，不能说“阶段2.5 已单独证明优于同步更新版阶段2”。
+
+---
+
 ## 阶段3：Hill 物理约束接入
 
 目标：补全 PGDL 的物理一致性约束，形成 `Model D`。
@@ -214,6 +259,29 @@
 验收标准：
 
 1. 模型总体性能不下降，且物理一致性指标显著改善。
+
+阶段3实施进展更新（截至 2026-03-31）：
+
+1. 已实现 Hill 核心模块：`src/core/stage3_hill.py`
+   - 包含 `hill_delta_lambda`、`build_delta_lambda_table`、`soft_argmax_peak_nm`
+   - 包含 `FixedHillCurve` 与 `LearnableHillCurve`
+2. 已实现 Stage 3 profile 与固定参数拟合脚本：
+   - `src/core/stage3_config.py`
+   - `scripts/fit_stage3_hill_params.py`
+3. 已实现 Stage 3 训练集成与 runner：
+   - `src/core/stage3_training.py`
+   - `scripts/train_joint_physics_dl.py`
+   - `scripts/run_stage3_experiment.py`
+4. 已生成固定 Hill 参数工件：`models/pretrained/stage3_hill_params.pth`
+5. 已完成 `3A-fixed-frozen` 单 seed smoke run：
+   - run name：`stage3_3a_fixed_frozen_seed20260325`
+   - MAE `6.5492`
+   - RMSE `13.4009`
+   - MAPE `36.068%`
+   - R2 `0.7592`
+6. 当前结论：
+   - 阶段3的工程链路已经打通，且 smoke run、artifact、snapshot、自动化测试均已成功。
+   - 但验收标准“总体性能不下降，且物理一致性指标显著改善”尚未完成证据闭环；后续仍需补 `3A/3B/3C` 多 seed 对比、`C vs C+Hill vs D` 的系统化消融，以及物理一致性图表。
 
 ---
 
@@ -327,18 +395,19 @@
 ## 6. 推荐周节奏（可执行版）
 
 第1周：阶段0 + 阶段1（拿下 Model C）  
-第2周：阶段2（跑通 `C+Cycle`）  
-第3周：阶段3（完成 Model D）  
-第4周：阶段4（全消融 + 鲁棒性）  
-第5周：阶段5（图表与论文包装）
+第2周：阶段2（完成 `C+Cycle` 结论收口）  
+第3周：阶段2.5（交替训练主干）+ 阶段3固定 Hill smoke run  
+第4周：阶段3多 seed 实验 + 阶段4主消融  
+第5周：阶段4补图表 + 阶段5论文包装
 
 ## 7. 里程碑判定
 
 M1：Model C 明确优于 B。  
-M2：联合训练脚本稳定产出权重。  
-M3：Model D 在至少两个关键维度优于 C。  
-M4：消融与图表可直接进入论文正文。
+M2：阶段2得出明确结论，确认同步更新版 `Cycle` 不再继续深挖。  
+M3：阶段2.5主干可稳定承载 Stage 3，并产出固定 Hill smoke run。  
+M4：Model D 在至少两个关键维度优于 C，或在物理一致性与极端浓度段形成明确收益。  
+M5：消融与图表可直接进入论文正文。
 
 ---
 
-一句话执行策略：先做“结构创新可证据化”（Fusion），再做“物理约束可解释化”（PGDL），最终用系统化消融把故事闭环。
+一句话执行策略：先做“结构创新可证据化”（Fusion），再用阶段2.5把联合训练主干稳定下来，随后接入 Hill 物理约束，最后用系统化消融把故事闭环。
