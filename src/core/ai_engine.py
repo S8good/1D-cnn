@@ -54,27 +54,25 @@ class FullSpectrumAIEngine:
     def load_models(self):
         """Load trained model weights and normalization parameters."""
         try:
-            norm_path = self._resolve_artifact('norm_params.pth')
-            pred_path = self._resolve_artifact('spectral_predictor.pth')
-            gen_path = self._resolve_artifact('spectral_generator.pth')
+            # Legacy full-spectrum predictor + generator are optional.
+            legacy_norm_path = self._resolve_artifact('norm_params.pth') or self._resolve_artifact('predictor_v1_norm_params.pth')
+            legacy_pred_path = self._resolve_artifact('spectral_predictor.pth') or self._resolve_artifact('spectral_predictor_v1_split.pth')
+            legacy_gen_path = self._resolve_artifact('spectral_generator.pth')
 
-            if norm_path is None or pred_path is None or gen_path is None:
-                print(
-                    'AI engine could not find required artifacts '
-                    f'(searched: {self.model_search_dirs}). Please run training first.'
-                )
-                return False
+            if legacy_norm_path is not None and legacy_pred_path is not None:
+                self.norm_params = self._load_torch_file(legacy_norm_path)
+                seq_len = len(self.norm_params['wavelengths'])
 
-            self.norm_params = self._load_torch_file(norm_path)
-            seq_len = len(self.norm_params['wavelengths'])
+                self.predictor = SpectralPredictor(seq_len=seq_len).to(self.device)
+                self.predictor.load_state_dict(self._load_torch_file(legacy_pred_path))
+                self.predictor.eval()
+                print('AI engine loaded legacy predictor.')
 
-            self.predictor = SpectralPredictor(seq_len=seq_len).to(self.device)
-            self.predictor.load_state_dict(self._load_torch_file(pred_path))
-            self.predictor.eval()
-
-            self.generator = SpectrumGenerator(seq_len=seq_len).to(self.device)
-            self.generator.load_state_dict(self._load_torch_file(gen_path))
-            self.generator.eval()
+            if self.norm_params is not None and legacy_gen_path is not None:
+                self.generator = SpectrumGenerator(seq_len=len(self.norm_params['wavelengths'])).to(self.device)
+                self.generator.load_state_dict(self._load_torch_file(legacy_gen_path))
+                self.generator.eval()
+                print('AI engine loaded legacy generator.')
 
             # Optional robust predictor v2.
             pred_v2_path = self._resolve_artifact('spectral_predictor_v2.pth')
@@ -93,12 +91,23 @@ class FullSpectrumAIEngine:
                     self.v2_calibration = self._load_torch_file(cal_path)
                     print('AI engine loaded predictor v2 calibration layer.')
 
-            self.is_loaded = True
-            print(
-                'AI engine (predictor + generator) loaded successfully '
-                f'from search dirs: {self.model_search_dirs}'
+            self.is_loaded = any(
+                obj is not None
+                for obj in (self.predictor, self.predictor_v2, self.generator)
             )
-            return True
+
+            if self.is_loaded:
+                print(
+                    'AI engine loaded available artifacts '
+                    f'from search dirs: {self.model_search_dirs}'
+                )
+                return True
+
+            print(
+                'AI engine could not find any supported predictor or generator artifacts '
+                f'(searched: {self.model_search_dirs}).'
+            )
+            return False
 
         except Exception as e:
             print(f'Failed to load models: {e}')
@@ -111,6 +120,8 @@ class FullSpectrumAIEngine:
         """Return wavelength axis used by the full-spectrum models."""
         if self.norm_params is not None:
             return np.asarray(self.norm_params['wavelengths'], dtype=np.float32)
+        if self.v2_norm_params is not None:
+            return np.asarray(self.v2_norm_params['wavelengths'], dtype=np.float32)
         return np.linspace(400, 800, 745, dtype=np.float32)
 
     def _prepare_input_spectrum(self, spectrum_ys, target_wavelengths=None):
@@ -134,6 +145,8 @@ class FullSpectrumAIEngine:
         return spec_rs.astype(np.float32)
 
     def _predict_concentration_v1(self, spectrum_ys):
+        if self.predictor is None:
+            raise RuntimeError('legacy predictor is not loaded')
         with torch.no_grad():
             spec = self._prepare_input_spectrum(spectrum_ys)
             spec_tensor = torch.FloatTensor(spec)
@@ -183,6 +196,8 @@ class FullSpectrumAIEngine:
             except Exception as e:
                 print(f'Predictor v2 failed, fallback to v1: {e}')
 
+        if self.predictor is None:
+            return 0.0
         return self._predict_concentration_v1(spectrum_ys)
 
     def interpret_concentration(self, pred_concentration):
@@ -222,10 +237,15 @@ class FullSpectrumAIEngine:
 
     def generate_spectrum(self, concentration):
         """Input concentration (ng/ml) and generate corresponding spectrum."""
-        if not self.is_loaded:
+        if not self.is_loaded or self.generator is None or self.norm_params is None:
             if self.norm_params is not None:
                 return np.zeros(len(self.norm_params['wavelengths']), dtype=np.float32)
+            if self.v2_norm_params is not None:
+                return np.zeros(len(self.v2_norm_params['wavelengths']), dtype=np.float32)
             return np.zeros(745, dtype=np.float32)
+
+        if 'spec_min' not in self.norm_params or 'spec_max' not in self.norm_params:
+            return np.zeros(len(self.norm_params['wavelengths']), dtype=np.float32)
 
         with torch.no_grad():
             log_conc = np.log10(float(concentration) + 1e-3)
