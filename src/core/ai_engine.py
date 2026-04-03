@@ -1,8 +1,14 @@
-﻿import os
+import os
 import numpy as np
 import torch
 
-from src.core.full_spectrum_models import SpectralPredictor, SpectralPredictorV2, SpectrumGenerator
+from src.core.full_spectrum_models import (
+    SpectralPredictor,
+    SpectralPredictorV2,
+    SpectralPredictorV2_Fusion,
+    SpectrumGenerator,
+)
+from src.core.physics_models import extract_spectrum_features
 
 
 class FullSpectrumAIEngine:
@@ -13,26 +19,16 @@ class FullSpectrumAIEngine:
             models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'models'))
 
         self.models_dir = os.path.abspath(models_dir)
-        if os.path.basename(self.models_dir).lower() == "pretrained":
-            self.model_search_dirs = [
-                self.models_dir,
-                os.path.dirname(self.models_dir),
-            ]
+        if os.path.basename(self.models_dir).lower() == 'pretrained':
+            self.model_search_dirs = [self.models_dir, os.path.dirname(self.models_dir)]
         else:
-            self.model_search_dirs = [
-                os.path.join(self.models_dir, "pretrained"),
-                self.models_dir,
-            ]
-        self.predictor = None
-        self.predictor_v2 = None
-        self.generator = None
-        self.norm_params = None
-        self.v2_norm_params = None
-        self.v2_calibration = None
+            self.model_search_dirs = [os.path.join(self.models_dir, 'pretrained'), self.models_dir]
+
+        self.linear_uloq_ng_ml = 18.0
+        self._mode_registry = {}
+        self._runtime_cache = {}
         self.is_loaded = False
         self.v2_loaded = False
-        self.linear_uloq_ng_ml = 18.0
-
         self.load_models()
 
     def _load_torch_file(self, path):
@@ -51,84 +47,105 @@ class FullSpectrumAIEngine:
                 return p
         return None
 
+    def _discover_mode_registry(self):
+        registry = {}
+
+        def add_mode(mode, predictor_type, predictor_file, norm_file, generator_file=None):
+            predictor_path = self._resolve_artifact(predictor_file)
+            norm_path = self._resolve_artifact(norm_file)
+            if predictor_path is None or norm_path is None:
+                return
+            generator_path = self._resolve_artifact(generator_file) if generator_file else None
+            registry[mode] = {
+                'predictor_type': predictor_type,
+                'predictor_path': predictor_path,
+                'norm_path': norm_path,
+                'generator_path': generator_path,
+            }
+
+        add_mode('v1', 'v1', 'spectral_predictor_v1_split.pth', 'predictor_v1_norm_params.pth', 'spectral_generator.pth')
+        add_mode('v2', 'v2', 'spectral_predictor_v2.pth', 'predictor_v2_norm_params.pth')
+        add_mode('v2_cycle', 'fusion', 'spectral_predictor_v2_cycle.pth', 'predictor_v2_cycle_norm_params.pth', 'spectral_generator_cycle.pth')
+        add_mode('v2_fusion', 'fusion', 'spectral_predictor_v2_fusion.pth', 'predictor_v2_fusion_norm_params.pth')
+        add_mode('stage3_3a_fixed_frozen', 'fusion', 'spectral_predictor_v2_stage3_3a_fixed_frozen.pth', 'predictor_v2_stage3_3a_fixed_frozen_norm_params.pth', 'spectral_generator_stage3_3a_fixed_frozen.pth')
+        add_mode('stage3_3b_fixed_regressor', 'fusion', 'spectral_predictor_v2_stage3_3b_fixed_regressor.pth', 'predictor_v2_stage3_3b_fixed_regressor_norm_params.pth', 'spectral_generator_stage3_3b_fixed_regressor.pth')
+        add_mode('stage3_3c_learnable_regressor', 'fusion', 'spectral_predictor_v2_stage3_3c_learnable_regressor.pth', 'predictor_v2_stage3_3c_learnable_regressor_norm_params.pth', 'spectral_generator_stage3_3c_learnable_regressor.pth')
+        add_mode('stage3_ch_fixed_regressor', 'fusion', 'spectral_predictor_v2_stage3_ch_fixed_regressor.pth', 'predictor_v2_stage3_ch_fixed_regressor_norm_params.pth', 'spectral_generator_stage3_ch_fixed_regressor.pth')
+        return registry
+
     def load_models(self):
-        """Load trained model weights and normalization parameters."""
         try:
-            # Legacy full-spectrum predictor + generator are optional.
-            legacy_norm_path = self._resolve_artifact('norm_params.pth') or self._resolve_artifact('predictor_v1_norm_params.pth')
-            legacy_pred_path = self._resolve_artifact('spectral_predictor.pth') or self._resolve_artifact('spectral_predictor_v1_split.pth')
-            legacy_gen_path = self._resolve_artifact('spectral_generator.pth')
-
-            if legacy_norm_path is not None and legacy_pred_path is not None:
-                self.norm_params = self._load_torch_file(legacy_norm_path)
-                seq_len = len(self.norm_params['wavelengths'])
-
-                self.predictor = SpectralPredictor(seq_len=seq_len).to(self.device)
-                self.predictor.load_state_dict(self._load_torch_file(legacy_pred_path))
-                self.predictor.eval()
-                print('AI engine loaded legacy predictor.')
-
-            if self.norm_params is not None and legacy_gen_path is not None:
-                self.generator = SpectrumGenerator(seq_len=len(self.norm_params['wavelengths'])).to(self.device)
-                self.generator.load_state_dict(self._load_torch_file(legacy_gen_path))
-                self.generator.eval()
-                print('AI engine loaded legacy generator.')
-
-            # Optional robust predictor v2.
-            pred_v2_path = self._resolve_artifact('spectral_predictor_v2.pth')
-            v2_params_path = self._resolve_artifact('predictor_v2_norm_params.pth')
-            if pred_v2_path is not None and v2_params_path is not None:
-                self.v2_norm_params = self._load_torch_file(v2_params_path)
-                v2_len = len(self.v2_norm_params['wavelengths'])
-                self.predictor_v2 = SpectralPredictorV2(seq_len=v2_len).to(self.device)
-                self.predictor_v2.load_state_dict(self._load_torch_file(pred_v2_path))
-                self.predictor_v2.eval()
-                self.v2_loaded = True
-                print('AI engine loaded robust predictor v2.')
-
-                cal_path = self._resolve_artifact('predictor_v2_calibration.pth')
-                if cal_path is not None:
-                    self.v2_calibration = self._load_torch_file(cal_path)
-                    print('AI engine loaded predictor v2 calibration layer.')
-
-            self.is_loaded = any(
-                obj is not None
-                for obj in (self.predictor, self.predictor_v2, self.generator)
-            )
-
+            self._mode_registry = self._discover_mode_registry()
+            self._runtime_cache = {}
+            self.is_loaded = bool(self._mode_registry)
+            self.v2_loaded = 'v2' in self._mode_registry
             if self.is_loaded:
-                print(
-                    'AI engine loaded available artifacts '
-                    f'from search dirs: {self.model_search_dirs}'
-                )
-                return True
-
-            print(
-                'AI engine could not find any supported predictor or generator artifacts '
-                f'(searched: {self.model_search_dirs}).'
-            )
-            return False
-
+                print(f'AI engine discovered model modes: {sorted(self._mode_registry.keys())}')
+            else:
+                print(f'AI engine could not find any supported predictor artifacts (searched: {self.model_search_dirs}).')
+            return self.is_loaded
         except Exception as e:
             print(f'Failed to load models: {e}')
+            self._mode_registry = {}
+            self._runtime_cache = {}
             self.is_loaded = False
             self.v2_loaded = False
-            self.v2_calibration = None
             return False
 
-    def get_wavelengths(self):
-        """Return wavelength axis used by the full-spectrum models."""
-        if self.norm_params is not None:
-            return np.asarray(self.norm_params['wavelengths'], dtype=np.float32)
-        if self.v2_norm_params is not None:
-            return np.asarray(self.v2_norm_params['wavelengths'], dtype=np.float32)
-        return np.linspace(400, 800, 745, dtype=np.float32)
+    def available_model_modes(self):
+        return sorted(self._mode_registry.keys())
+
+    def _resolve_mode(self, model_mode='auto'):
+        if model_mode and model_mode != 'auto' and model_mode in self._mode_registry:
+            return model_mode
+        for preferred in ('v2', 'stage3_ch_fixed_regressor', 'stage3_3c_learnable_regressor', 'v2_cycle', 'v1'):
+            if preferred in self._mode_registry:
+                return preferred
+        if self._mode_registry:
+            return sorted(self._mode_registry.keys())[0]
+        return None
+
+    def _load_runtime(self, mode):
+        if mode in self._runtime_cache:
+            return self._runtime_cache[mode]
+
+        cfg = self._mode_registry[mode]
+        norm_params = self._load_torch_file(cfg['norm_path'])
+        seq_len = len(norm_params['wavelengths'])
+        predictor_type = cfg['predictor_type']
+        if predictor_type == 'v1':
+            predictor = SpectralPredictor(seq_len=seq_len).to(self.device)
+        elif predictor_type == 'fusion':
+            predictor = SpectralPredictorV2_Fusion(seq_len=seq_len).to(self.device)
+        else:
+            predictor = SpectralPredictorV2(seq_len=seq_len).to(self.device)
+        predictor.load_state_dict(self._load_torch_file(cfg['predictor_path']))
+        predictor.eval()
+
+        generator = None
+        if cfg.get('generator_path'):
+            generator = SpectrumGenerator(seq_len=seq_len).to(self.device)
+            generator.load_state_dict(self._load_torch_file(cfg['generator_path']))
+            generator.eval()
+
+        runtime = {
+            'mode': mode,
+            'predictor_type': predictor_type,
+            'predictor': predictor,
+            'norm_params': norm_params,
+            'generator': generator,
+        }
+        self._runtime_cache[mode] = runtime
+        return runtime
+
+    def get_wavelengths(self, model_mode='auto'):
+        mode = self._resolve_mode(model_mode)
+        if mode is None:
+            return np.linspace(400, 800, 745, dtype=np.float32)
+        runtime = self._load_runtime(mode)
+        return np.asarray(runtime['norm_params']['wavelengths'], dtype=np.float32)
 
     def _prepare_input_spectrum(self, spectrum_ys, target_wavelengths=None):
-        """
-        Ensure the input spectrum is 1D and aligned to target wavelength length.
-        If length mismatches, linear-resample to target length.
-        """
         if target_wavelengths is None:
             target_wavelengths = self.get_wavelengths()
         target_wl = np.asarray(target_wavelengths, dtype=np.float32).reshape(-1)
@@ -144,71 +161,49 @@ class FullSpectrumAIEngine:
         spec_rs = np.interp(target_wl, src_x, spec)
         return spec_rs.astype(np.float32)
 
-    def _predict_concentration_v1(self, spectrum_ys):
-        if self.predictor is None:
-            raise RuntimeError('legacy predictor is not loaded')
+    def _predict_concentration_with_runtime(self, runtime, spectrum_ys):
+        predictor_type = runtime['predictor_type']
+        norm_params = runtime['norm_params']
+        wl = np.asarray(norm_params['wavelengths'], dtype=np.float32)
+        spec = self._prepare_input_spectrum(spectrum_ys, target_wavelengths=wl)
+
         with torch.no_grad():
-            spec = self._prepare_input_spectrum(spectrum_ys)
-            spec_tensor = torch.FloatTensor(spec)
-            local_min = spec_tensor.min()
-            local_max = spec_tensor.max()
-            spec_norm = (spec_tensor - local_min) / (local_max - local_min + 1e-8)
-            spec_norm = spec_norm.unsqueeze(0).unsqueeze(0).to(self.device)
-            log_conc = self.predictor(spec_norm)
-            val = log_conc.item()
-            conc = (10 ** val) - 1e-3
-            return max(0.0, float(conc))
-
-    def _predict_concentration_v2(self, spectrum_ys):
-        with torch.no_grad():
-            wl = np.asarray(self.v2_norm_params['wavelengths'], dtype=np.float32)
-            spec = self._prepare_input_spectrum(spectrum_ys, target_wavelengths=wl)
-            diff = np.gradient(spec).astype(np.float32)
-
-            raw_med = np.asarray(self.v2_norm_params['raw_med'], dtype=np.float32)
-            raw_iqr = np.asarray(self.v2_norm_params['raw_iqr'], dtype=np.float32)
-            diff_med = np.asarray(self.v2_norm_params['diff_med'], dtype=np.float32)
-            diff_iqr = np.asarray(self.v2_norm_params['diff_iqr'], dtype=np.float32)
-
-            raw_norm = (spec - raw_med) / (raw_iqr + 1e-8)
-            diff_norm = (diff - diff_med) / (diff_iqr + 1e-8)
-            x = np.stack([raw_norm, diff_norm], axis=0).astype(np.float32)  # [2, L]
-            x_t = torch.from_numpy(x).unsqueeze(0).to(self.device)  # [1,2,L]
-            log_conc = self.predictor_v2(x_t).item()
-
-            if self.v2_calibration is not None:
-                x_thr = np.asarray(self.v2_calibration.get('x_thresholds', []), dtype=np.float32).reshape(-1)
-                y_thr = np.asarray(self.v2_calibration.get('y_thresholds', []), dtype=np.float32).reshape(-1)
-                if x_thr.size >= 2 and y_thr.size == x_thr.size:
-                    log_conc = float(np.interp(log_conc, x_thr, y_thr, left=y_thr[0], right=y_thr[-1]))
-
+            if predictor_type == 'v1':
+                spec_tensor = torch.FloatTensor(spec)
+                local_min = spec_tensor.min()
+                local_max = spec_tensor.max()
+                spec_norm = (spec_tensor - local_min) / (local_max - local_min + 1e-8)
+                spec_norm = spec_norm.unsqueeze(0).unsqueeze(0).to(self.device)
+                log_conc = runtime['predictor'](spec_norm).item()
+            else:
+                diff = np.gradient(spec).astype(np.float32)
+                raw_med = np.asarray(norm_params['raw_med'], dtype=np.float32)
+                raw_iqr = np.asarray(norm_params['raw_iqr'], dtype=np.float32)
+                diff_med = np.asarray(norm_params['diff_med'], dtype=np.float32)
+                diff_iqr = np.asarray(norm_params['diff_iqr'], dtype=np.float32)
+                raw_norm = (spec - raw_med) / (raw_iqr + 1e-8)
+                diff_norm = (diff - diff_med) / (diff_iqr + 1e-8)
+                x = np.stack([raw_norm, diff_norm], axis=0).astype(np.float32)
+                x_t = torch.from_numpy(x).unsqueeze(0).to(self.device)
+                if predictor_type == 'fusion':
+                    center, amp, fwhm = extract_spectrum_features(wl, spec)
+                    x_physics = torch.tensor([[center, amp, fwhm]], dtype=torch.float32).to(self.device)
+                    log_conc = runtime['predictor'](x_t, x_physics).item()
+                else:
+                    log_conc = runtime['predictor'](x_t).item()
             conc = (10 ** log_conc) - 1e-3
             return max(0.0, float(conc))
 
-    def predict_concentration(self, spectrum_ys):
-        """Input one spectrum and predict concentration (ng/ml)."""
-        if not self.is_loaded:
+    def predict_concentration(self, spectrum_ys, model_mode='auto'):
+        mode = self._resolve_mode(model_mode)
+        if mode is None:
             return 0.0
-
-        if self.v2_loaded and self.predictor_v2 is not None and self.v2_norm_params is not None:
-            try:
-                return self._predict_concentration_v2(spectrum_ys)
-            except Exception as e:
-                print(f'Predictor v2 failed, fallback to v1: {e}')
-
-        if self.predictor is None:
-            return 0.0
-        return self._predict_concentration_v1(spectrum_ys)
+        runtime = self._load_runtime(mode)
+        return self._predict_concentration_with_runtime(runtime, spectrum_ys)
 
     def interpret_concentration(self, pred_concentration):
-        """
-        Convert raw predicted concentration into reporting mode:
-        - <= ULOQ: quantitative report
-        - > ULOQ: super-quantitative (over-range) report with coarse bins
-        """
         pred = max(0.0, float(pred_concentration))
         uloq = float(self.linear_uloq_ng_ml)
-
         if pred <= uloq:
             return {
                 'mode': 'quantitative',
@@ -218,14 +213,12 @@ class FullSpectrumAIEngine:
                 'uloq_ng_ml': uloq,
                 'super_quant_bin': None,
             }
-
         if pred <= 40.0:
             bin_label = '18-40 ng/ml'
         elif pred <= 75.0:
             bin_label = '40-75 ng/ml'
         else:
             bin_label = '>75 ng/ml'
-
         return {
             'mode': 'super_quantitative',
             'raw_pred_ng_ml': pred,
@@ -235,66 +228,62 @@ class FullSpectrumAIEngine:
             'super_quant_bin': bin_label,
         }
 
-    def generate_spectrum(self, concentration):
-        """Input concentration (ng/ml) and generate corresponding spectrum."""
-        if not self.is_loaded or self.generator is None or self.norm_params is None:
-            if self.norm_params is not None:
-                return np.zeros(len(self.norm_params['wavelengths']), dtype=np.float32)
-            if self.v2_norm_params is not None:
-                return np.zeros(len(self.v2_norm_params['wavelengths']), dtype=np.float32)
+    def generate_spectrum(self, concentration, model_mode='auto'):
+        mode = self._resolve_mode(model_mode)
+        if mode is None:
             return np.zeros(745, dtype=np.float32)
-
-        if 'spec_min' not in self.norm_params or 'spec_max' not in self.norm_params:
-            return np.zeros(len(self.norm_params['wavelengths']), dtype=np.float32)
+        runtime = self._load_runtime(mode)
+        norm_params = runtime['norm_params']
+        generator = runtime['generator']
+        if generator is None:
+            return np.zeros(len(norm_params['wavelengths']), dtype=np.float32)
 
         with torch.no_grad():
             log_conc = np.log10(float(concentration) + 1e-3)
             conc_tensor = torch.FloatTensor([[log_conc]]).to(self.device)
-
-            gen_norm = self.generator(conc_tensor)
-            gen_norm = gen_norm.squeeze().cpu().numpy()
-
-            spec_min = float(self.norm_params['spec_min'])
-            spec_max = float(self.norm_params['spec_max'])
-            real_spectrum = gen_norm * (spec_max - spec_min + 1e-8) + spec_min
-            return real_spectrum.astype(np.float32)
+            gen_norm = generator(conc_tensor).squeeze().cpu().numpy()
+            # Backward compatibility:
+            # - Older full-spectrum checkpoints used global spec_min/spec_max.
+            # - Stage2.5/Stage3 checkpoints use per-wavelength robust stats (raw_med/raw_iqr).
+            if 'spec_min' in norm_params and 'spec_max' in norm_params:
+                spec_min = float(norm_params['spec_min'])
+                spec_max = float(norm_params['spec_max'])
+                real_spectrum = gen_norm * (spec_max - spec_min + 1e-8) + spec_min
+                return real_spectrum.astype(np.float32)
+            if 'raw_med' in norm_params and 'raw_iqr' in norm_params:
+                raw_med = np.asarray(norm_params['raw_med'], dtype=np.float32).reshape(-1)
+                raw_iqr = np.asarray(norm_params['raw_iqr'], dtype=np.float32).reshape(-1)
+                if raw_med.size == gen_norm.size and raw_iqr.size == gen_norm.size:
+                    real_spectrum = gen_norm * (raw_iqr + 1e-8) + raw_med
+                    return real_spectrum.astype(np.float32)
+            return np.asarray(gen_norm, dtype=np.float32).reshape(-1)
 
     def _intensity_align(self, input_spectrum, pred_spectrum):
-        """
-        Align predicted spectrum intensity to input spectrum using robust
-        scale + offset calibration on percentiles (to reduce peak-height bias).
-        """
         x = np.asarray(input_spectrum, dtype=np.float32).reshape(-1)
         y = np.asarray(pred_spectrum, dtype=np.float32).reshape(-1)
         if x.size == 0 or y.size == 0 or x.size != y.size:
             return y.astype(np.float32), 1.0, 0.0
-
         x_p10, x_p50, x_p90 = np.percentile(x, [10, 50, 90]).astype(np.float32)
         y_p10, y_p50, y_p90 = np.percentile(y, [10, 50, 90]).astype(np.float32)
-
         y_span = float(y_p90 - y_p10)
         if abs(y_span) < 1e-8:
             return y.astype(np.float32), 1.0, 0.0
-
         scale = float((x_p90 - x_p10) / (y_span + 1e-8))
         scale = float(np.clip(scale, 0.2, 5.0))
         offset = float(x_p50 - scale * y_p50)
         aligned = scale * y + offset
         return aligned.astype(np.float32), scale, offset
 
-    def predict_spectrum_from_spectrum(self, spectrum_ys):
-        """
-        Spectrum-to-spectrum mapping via AI chain:
-          input spectrum -> predicted concentration -> generated spectrum
-        """
-        wavelengths = self.get_wavelengths()
-        input_resampled = self._prepare_input_spectrum(spectrum_ys)
-        pred_concentration = self.predict_concentration(input_resampled)
+    def predict_spectrum_from_spectrum(self, spectrum_ys, model_mode='auto'):
+        mode = self._resolve_mode(model_mode)
+        wavelengths = self.get_wavelengths(mode)
+        input_resampled = self._prepare_input_spectrum(spectrum_ys, target_wavelengths=wavelengths)
+        pred_concentration = self.predict_concentration(input_resampled, model_mode=mode)
         report = self.interpret_concentration(pred_concentration)
-        pred_spectrum_raw = self.generate_spectrum(pred_concentration)
+        pred_spectrum_raw = self.generate_spectrum(pred_concentration, model_mode=mode)
         pred_spectrum, spec_scale, spec_offset = self._intensity_align(input_resampled, pred_spectrum_raw)
-
         return {
+            'model_mode': mode,
             'pred_concentration': float(pred_concentration),
             'report_mode': report['mode'],
             'reported_concentration': report['reported_ng_ml'],
