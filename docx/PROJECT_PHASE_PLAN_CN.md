@@ -1,4 +1,4 @@
-﻿# LSPR 论文与工程联合落地计划（阶段版）
+# LSPR 论文与工程联合落地计划（阶段版）
 
 本文档用于指导 `LSPR_Spectra_Master` 从当前版本推进到可发表高水平 SCI/EI 交叉学科论文的完整实施路径。目标是把“特征融合注入（Fusion）+ PGDL（Cycle + Hill）”做成可复现、可解释、可对比的工程与论文一体化方案，并在 Hill 接入前显式加入 `阶段2.5` 交替联合训练闸门。
 
@@ -11,13 +11,16 @@
 3. 形成论文所需核心图表：架构图、消融表、Bland-Altman、True-vs-Pred、物理一致性图、单调违例率表。
 4. 交付可复现实验脚本、固定数据切分、固定随机种子、可追溯模型工件。
 
-### 当前进度摘要（截至 2026-03-31）
+### 当前进度摘要（截至 2026-04-02）
 
 1. 阶段0、阶段1已完成，`Model C (V2_Fusion)` 相比 `Model B (V2)` 在 MAE/RMSE/R2 三项核心指标上已有明确提升。
 2. 阶段2已完成 `3-seed` 复核，结论是 `C+Cycle(regressor)` 未带来稳定收益，因此主线不再围绕同步更新版 `Cycle` 继续小步调参。
 3. 阶段2.5/阶段3的工程基础设施已落地：已实现 Hill 核心模块、Stage 3 配置、交替训练原语、训练入口集成、固定 Hill 参数拟合脚本与实验 runner。
-4. 已完成 `3A-fixed-frozen` 单 seed smoke run，测试指标为：MAE `6.5492`，RMSE `13.4009`，MAPE `36.068%`，R2 `0.7592`；对应快照目录为 `outputs/stage3_3a_fixed_frozen_seed20260325/`。
-5. 当前代码验证状态：Stage 3 相关自动化测试 `17 passed`，说明工程链路已经打通；但尚不能据此声称阶段3已在论文指标上优于 `Model C`，后续仍需继续做 `3A/3B/3C` 多 seed 对比与阶段4系统化消融。
+4. 已完成修正后训练链路下的 `3A/3B/3C` 公平 `3-seed` 对比；关键修正是训练期 `lambda_BSA` 必须使用原始 nm，而不是归一化特征。
+5. `3-seed` 结果表明：`3C-learnable-regressor` 当前在 `RMSE`、`R2` 与 `Hill-consistency error` 三项指标上最优，是阶段3的主线候选配置。
+6. 当前代码验证状态：已在 `py39` 环境中完成自动化验证，执行 `conda run -n py39 pytest` 得到 `32 passed, 1 warning`；`gan` 环境可正常导入 `torch`，可作为备选运行环境。当前不建议使用 base/3.12 环境作为正式验证环境。
+7. **阶段4核心结果产物已基本生成**：已输出 `ablation_summary.csv`、`ablation_comparison_figure.png`、`segment_stats_table.csv`、`segment_stats_figure.png`、`true_vs_pred_3c_figure.png`、`bland_altman_3c_figure.png`、`hill_consistency_figure.png`，已能支撑结果章节主叙事。
+8. **阶段5论文打包已进入收口阶段**：`scripts/plot_stage3_comparison.py`、`scripts/plot_ablation_full.py`、`scripts/plot_supplementary.py` 已产出主要图表，`docx/METHODS_RESULTS_EN.md`、`docx/RESULTS_DRAFT_CN.md`、`docx/FORMULAS_CN_PLAIN.md` 已形成论文文字与公式草稿；当前主要剩余工作是统一图文口径并补齐少量附加实验/复现说明。
 
 ## 2. 阶段拆解总览
 
@@ -222,7 +225,7 @@
 1. 已在代码中落地交替训练原语：`src/core/stage3_training.py` 提供 hill-aware generator step 与 alternating epoch runner。
 2. 已定义 `3A-fixed-frozen`、`3B-fixed-regressor`、`3C-learnable-regressor` 三个 Stage 3 profile，均以 `2.5C` 为母体配置。
 3. 当前 `3A-fixed-frozen` smoke run 已成功打通，说明 `2.5C` 风格主干已满足“可承载 Stage 3”的最小工程门槛。
-4. 但阶段2.5作为独立论文结论仍未完成多 seed 统计，因此当前只能说“主干已可用”，不能说“阶段2.5 已单独证明优于同步更新版阶段2”。
+4. 在此主干上完成的 Stage 3 `3-seed` 对比已经证明：阶段2.5 不只是“可承载 Stage 3”，而且确实为后续 Hill 约束提供了可稳定优化的母体配置。
 
 ---
 
@@ -273,15 +276,21 @@
    - `scripts/train_joint_physics_dl.py`
    - `scripts/run_stage3_experiment.py`
 4. 已生成固定 Hill 参数工件：`models/pretrained/stage3_hill_params.pth`
-5. 已完成 `3A-fixed-frozen` 单 seed smoke run：
-   - run name：`stage3_3a_fixed_frozen_seed20260325`
-   - MAE `6.5492`
-   - RMSE `13.4009`
-   - MAPE `36.068%`
-   - R2 `0.7592`
-6. 当前结论：
-   - 阶段3的工程链路已经打通，且 smoke run、artifact、snapshot、自动化测试均已成功。
-   - 但验收标准“总体性能不下降，且物理一致性指标显著改善”尚未完成证据闭环；后续仍需补 `3A/3B/3C` 多 seed 对比、`C vs C+Hill vs D` 的系统化消融，以及物理一致性图表。
+5. 已完成 `3A-fixed-frozen`、`3B-fixed-regressor`、`3C-learnable-regressor` 的公平 `3-seed` 对比，统一 seed 为：
+   - `20260325`
+   - `20260331`
+   - `20260407`
+6. `3-seed` 汇总结果：
+   - `3A-fixed-frozen`：MAE `6.5492 ± 0.0000`，RMSE `13.4009 ± 0.0000`，R2 `0.7592 ± 0.0000`，Hill-MAE `2.2556 ± 0.0778`
+   - `3B-fixed-regressor`：MAE `6.4325 ± 0.0383`，RMSE `13.3490 ± 0.1977`，R2 `0.7611 ± 0.0071`，Hill-MAE `1.8591 ± 0.2502`
+   - `3C-learnable-regressor`：MAE `6.5292 ± 0.0675`，RMSE `13.2483 ± 0.2347`，R2 `0.7646 ± 0.0083`，Hill-MAE `1.6982 ± 0.0262`
+7. 关键工程发现：
+   - `3C` 早期效果不佳的主要原因不是 learnable Hill 参数本身，而是训练期 `Hill loss` 误用了归一化后的 `lambda_BSA` 特征。
+   - 在修正 `lambda_BSA` 坐标后，并让 `3C` 从 `3A` generator 权重启动且进行短 warmup，`Hill-MAE` 从 `7.8~8.2 nm` 显著降到 `1.6982 nm`。
+8. 当前结论：
+   - 若优先看物理一致性，`3C` 是当前最佳配置。
+   - 若综合看 `RMSE + R2 + Hill-MAE`，`3C` 也是当前阶段3最强主线。
+   - 后续阶段4应以 `C vs 3A vs 3B vs 3C` 为核心对比面板，并继续补图表与分段分析。
 
 ---
 
@@ -317,6 +326,28 @@
 验收标准：
 
 1. 审稿视角下可回答“为什么有效、哪部分有效、在什么场景有效”。
+
+阶段4进展（截至 2026-04-02）：
+
+1. 已完成主结果面板与表格输出：
+   - `outputs/ablation_summary.csv`
+   - `outputs/ablation_comparison_figure.png`
+   - `outputs/true_vs_pred_3c_figure.png`
+   - `outputs/bland_altman_3c_figure.png`
+   - `outputs/hill_consistency_figure.png`
+2. 已完成分段统计输出：
+   - `outputs/segment_stats_table.csv`
+   - `outputs/segment_stats_figure.png`
+3. 当前阶段4可以支撑的核心结论：
+   - `A -> B`：双通道输入带来显著收益；
+   - `B -> C`：BSA 物理分支进一步提升 MAE/RMSE/R2；
+   - `3A/3B/3C`：在 Stage 3 内部对比中，`3C-learnable-regressor` 在 `RMSE`、`R2`、`Hill-MAE` 上综合最优。
+4. 当前阶段4尚未完全收口的部分：
+   - `C+Hill` 作为独立消融项尚未单独固化为最终面板；
+   - 鲁棒性/噪声扰动实验尚未形成正式结果图；
+   - `Monotonicity Violation Rate (MVR)` 尚未形成最终论文表格。
+5. 阶段判断：
+   - 阶段4已从“计划态”进入“结果已基本成型、尚需补完少量边角项”的状态。
 
 ---
 
@@ -356,7 +387,37 @@
 
 验收标准：
 
-1. 内部预审可通过“可复现性 + 方法创新性 + 物理一致性”三项核查。
+1. 内部预审可通过"可复现性 + 方法创新性 + 物理一致性"三项核查。
+
+阶段5进展（截至 2026-04-02）：
+
+已完成主要图表与文稿草稿，包含以下内容：
+
+1. Stage 3 主图与表格（脚本：`scripts/plot_stage3_comparison.py`）：
+   - `outputs/stage3_comparison_figure.png` — Figure 1：1x5 分组柱状图（3A/3B/3C，误差棒，Hill-MAE 灰底，最优值标星）
+   - `outputs/stage3_hilmae_figure.png` — Figure 1b：Hill-MAE 独立放大图（可独立插图引用）
+   - `outputs/stage3_seed_detail_figure.png` — Figure 2：3x5 Seed 明细散点图（含均值线与范围带）
+   - `outputs/stage3_paper_table.csv` — Table 1：论文摘要表（mean±std 格式，`*` 标最优值）
+2. 阶段4主结果与补充图（脚本：`scripts/plot_ablation_full.py`、`scripts/plot_supplementary.py`）：
+   - `outputs/ablation_comparison_figure.png`
+   - `outputs/true_vs_pred_3c_figure.png`
+   - `outputs/bland_altman_3c_figure.png`
+   - `outputs/hill_consistency_figure.png`
+   - `outputs/segment_stats_figure.png`
+3. 文稿草稿已形成：
+   - `docx/METHODS_RESULTS_EN.md`
+   - `docx/RESULTS_DRAFT_CN.md`
+   - `docx/FORMULAS_CN_PLAIN.md`
+4. 核心结论（可直接写入论文）：
+   - 3C 在 RMSE（13.2483±0.2347）、R2（0.7646±0.0083）、Hill-MAE（1.6982±0.0262 nm）三项最优且 Hill-MAE 方差最小；
+   - 综合判定 **3C-learnable-regressor 为阶段3最强主线**。
+5. 当前阶段5剩余工作：
+   - 统一方法图、Methods 文本与代码实现的口径，避免示意图与实现细节不一致；
+   - 补齐复现说明，包括推荐环境、执行命令、依赖清单；
+   - 决定论文主模型命名口径（`Model D` 与 `3C-learnable-regressor` 的映射表述）并全稿统一；
+   - 视投稿目标补充少量审稿人敏感项，如 MVR 表或鲁棒性附图。
+
+---
 
 ## 4. 关键指标定义（建议统一）
 
@@ -402,11 +463,11 @@
 
 ## 7. 里程碑判定
 
-M1：Model C 明确优于 B。  
-M2：阶段2得出明确结论，确认同步更新版 `Cycle` 不再继续深挖。  
-M3：阶段2.5主干可稳定承载 Stage 3，并产出固定 Hill smoke run。  
-M4：Model D 在至少两个关键维度优于 C，或在物理一致性与极端浓度段形成明确收益。  
-M5：消融与图表可直接进入论文正文。
+M1：Model C 明确优于 B。✅  
+M2：阶段2得出明确结论，确认同步更新版 `Cycle` 不再继续深挖。✅  
+M3：阶段2.5主干可稳定承载 Stage 3，并产出固定 Hill smoke run。✅  
+M4：Model D 在至少两个关键维度优于 C，或在物理一致性与极端浓度段形成明确收益。🟡（3C 物理一致性领先已确认；完整 A/B/C/D 消融对比仍待补全）  
+M5：消融与图表可直接进入论文正文。🟡（Stage 3 内部图表已完成；完整消融全集仍待补全）
 
 ---
 
