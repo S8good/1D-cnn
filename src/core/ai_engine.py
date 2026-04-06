@@ -95,7 +95,7 @@ class FullSpectrumAIEngine:
     def available_model_modes(self):
         return sorted(self._mode_registry.keys())
 
-    def _resolve_mode(self, model_mode='auto'):
+    def resolve_prediction_mode(self, model_mode='auto'):
         if model_mode and model_mode != 'auto' and model_mode in self._mode_registry:
             return model_mode
         for preferred in ('v2', 'stage3_ch_fixed_regressor', 'stage3_3c_learnable_regressor', 'v2_cycle', 'v1'):
@@ -104,6 +104,29 @@ class FullSpectrumAIEngine:
         if self._mode_registry:
             return sorted(self._mode_registry.keys())[0]
         return None
+
+    def resolve_generator_mode(self, model_mode='auto'):
+        if model_mode and model_mode != 'auto' and model_mode in self._mode_registry:
+            return model_mode
+        for preferred in (
+            'stage3_3a_fixed_frozen',
+            'stage3_3b_fixed_regressor',
+            'stage3_3c_learnable_regressor',
+            'stage3_ch_fixed_regressor',
+            'v2_cycle',
+            'v1',
+        ):
+            if preferred in self._mode_registry and self._mode_registry[preferred].get('generator_path'):
+                return preferred
+        for mode in sorted(self._mode_registry.keys()):
+            if self._mode_registry[mode].get('generator_path'):
+                return mode
+        if self._mode_registry:
+            return sorted(self._mode_registry.keys())[0]
+        return None
+
+    def _resolve_mode(self, model_mode='auto'):
+        return self.resolve_prediction_mode(model_mode)
 
     def _load_runtime(self, mode):
         if mode in self._runtime_cache:
@@ -139,7 +162,7 @@ class FullSpectrumAIEngine:
         return runtime
 
     def get_wavelengths(self, model_mode='auto'):
-        mode = self._resolve_mode(model_mode)
+        mode = self.resolve_generator_mode(model_mode)
         if mode is None:
             return np.linspace(400, 800, 745, dtype=np.float32)
         runtime = self._load_runtime(mode)
@@ -194,23 +217,46 @@ class FullSpectrumAIEngine:
             conc = (10 ** log_conc) - 1e-3
             return max(0.0, float(conc))
 
-    def predict_concentration(self, spectrum_ys, model_mode='auto'):
-        mode = self._resolve_mode(model_mode)
-        if mode is None:
-            return 0.0
-        runtime = self._load_runtime(mode)
+    def predict_concentration_details(self, spectrum_ys, model_mode='auto'):
+        requested_mode = model_mode or 'auto'
+        resolved_mode = self.resolve_prediction_mode(requested_mode)
+        if resolved_mode is None:
+            return {
+                'requested_prediction_model': requested_mode,
+                'resolved_prediction_model': None,
+                'predicted_concentration_ng_ml': 0.0,
+                'fallback_applied': False,
+                'fallback_reason': None,
+            }
+        runtime = self._load_runtime(resolved_mode)
         prediction = self._predict_concentration_with_runtime(runtime, spectrum_ys)
+        fallback_applied = False
+        fallback_reason = None
+        actual_mode = resolved_mode
         if (
             runtime.get('predictor_type') == 'fusion'
             and prediction <= 0.0
-            and mode != 'v2'
+            and resolved_mode != 'v2'
             and 'v2' in self._mode_registry
         ):
             stable_runtime = self._load_runtime('v2')
             stable_prediction = self._predict_concentration_with_runtime(stable_runtime, spectrum_ys)
             if stable_prediction > 0.0:
-                return stable_prediction
-        return prediction
+                prediction = stable_prediction
+                actual_mode = 'v2'
+                fallback_applied = True
+                fallback_reason = 'prediction collapsed to zero; fell back to v2 predictor'
+        return {
+            'requested_prediction_model': requested_mode,
+            'resolved_prediction_model': actual_mode,
+            'predicted_concentration_ng_ml': float(prediction),
+            'fallback_applied': fallback_applied,
+            'fallback_reason': fallback_reason,
+        }
+
+    def predict_concentration(self, spectrum_ys, model_mode='auto'):
+        details = self.predict_concentration_details(spectrum_ys, model_mode=model_mode)
+        return float(details['predicted_concentration_ng_ml'])
 
     def interpret_concentration(self, pred_concentration):
         pred = max(0.0, float(pred_concentration))
@@ -240,7 +286,7 @@ class FullSpectrumAIEngine:
         }
 
     def generate_spectrum(self, concentration, model_mode='auto'):
-        mode = self._resolve_mode(model_mode)
+        mode = self.resolve_generator_mode(model_mode)
         if mode is None:
             return np.zeros(745, dtype=np.float32)
         runtime = self._load_runtime(mode)
@@ -285,16 +331,25 @@ class FullSpectrumAIEngine:
         aligned = scale * y + offset
         return aligned.astype(np.float32), scale, offset
 
-    def predict_spectrum_from_spectrum(self, spectrum_ys, model_mode='auto'):
-        mode = self._resolve_mode(model_mode)
-        wavelengths = self.get_wavelengths(mode)
+    def predict_spectrum_from_spectrum(self, spectrum_ys, model_mode='auto', prediction_model_mode=None, generator_model_mode=None):
+        requested_prediction_model = prediction_model_mode or model_mode or 'auto'
+        requested_generator_model = generator_model_mode or model_mode or 'auto'
+        generator_mode = self.resolve_generator_mode(requested_generator_model)
+        wavelengths = self.get_wavelengths(generator_mode)
         input_resampled = self._prepare_input_spectrum(spectrum_ys, target_wavelengths=wavelengths)
-        pred_concentration = self.predict_concentration(input_resampled, model_mode=mode)
+        prediction_details = self.predict_concentration_details(spectrum_ys, model_mode=requested_prediction_model)
+        pred_concentration = float(prediction_details['predicted_concentration_ng_ml'])
         report = self.interpret_concentration(pred_concentration)
-        pred_spectrum_raw = self.generate_spectrum(pred_concentration, model_mode=mode)
+        pred_spectrum_raw = self.generate_spectrum(pred_concentration, model_mode=generator_mode)
         pred_spectrum, spec_scale, spec_offset = self._intensity_align(input_resampled, pred_spectrum_raw)
         return {
-            'model_mode': mode,
+            'model_mode': generator_mode,
+            'requested_prediction_model': requested_prediction_model,
+            'resolved_prediction_model': prediction_details['resolved_prediction_model'],
+            'requested_generator_model': requested_generator_model,
+            'resolved_generator_model': generator_mode,
+            'fallback_applied': prediction_details['fallback_applied'],
+            'fallback_reason': prediction_details['fallback_reason'],
             'pred_concentration': float(pred_concentration),
             'report_mode': report['mode'],
             'reported_concentration': report['reported_ng_ml'],

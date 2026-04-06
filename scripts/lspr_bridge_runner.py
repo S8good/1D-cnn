@@ -89,9 +89,10 @@ def _predict_single(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not engine.is_loaded:
             return {'ok': False, 'backend': 'subprocess', 'error': {'code': 'models_not_loaded', 'message': 'models are not loaded'}}
         with contextlib.redirect_stdout(sys.stderr):
-            predicted = float(engine.predict_concentration(intensities, model_mode=model_mode))
+            prediction_details = engine.predict_concentration_details(intensities, model_mode=model_mode)
+            predicted = float(prediction_details['predicted_concentration_ng_ml'])
             report = engine.interpret_concentration(predicted)
-            resolved_mode = engine._resolve_mode(model_mode)
+            resolved_mode = prediction_details.get('resolved_prediction_model') or engine.resolve_prediction_mode(model_mode)
         return {
             'ok': True,
             'backend': 'subprocess',
@@ -101,7 +102,12 @@ def _predict_single(payload: Dict[str, Any]) -> Dict[str, Any]:
             'reported_text': report.get('reported_text'),
             'uloq_ng_ml': report.get('uloq_ng_ml'),
             'super_quant_bin': report.get('super_quant_bin'),
-            'metrics': {},
+            'metrics': {
+                'requested_prediction_model': prediction_details.get('requested_prediction_model'),
+                'resolved_prediction_model': prediction_details.get('resolved_prediction_model'),
+                'fallback_applied': bool(prediction_details.get('fallback_applied', False)),
+                'fallback_reason': prediction_details.get('fallback_reason'),
+            },
             'error': None,
         }
     except Exception as exc:
@@ -113,14 +119,22 @@ def _build_comparison(payload: Dict[str, Any]) -> Dict[str, Any]:
         from src.core.ai_engine import FullSpectrumAIEngine
         import numpy as np
         intensities = payload.get('intensities') or []
+        metadata = payload.get('metadata') or {}
         model_mode = payload.get('model_mode', 'auto')
+        prediction_model_mode = metadata.get('prediction_model_mode', 'auto')
+        generator_model_mode = metadata.get('generator_model_mode', model_mode)
         with contextlib.redirect_stdout(sys.stderr):
             engine = FullSpectrumAIEngine(models_dir=str(PROJECT_ROOT / 'models'))
         if not engine.is_loaded:
             return {'ok': False, 'backend': 'subprocess', 'error': {'code': 'models_not_loaded', 'message': 'models are not loaded, cannot run build_comparison'}}
 
         def predict_for_mode(mode: str):
-            return engine.predict_spectrum_from_spectrum(intensities, model_mode=mode)
+            return engine.predict_spectrum_from_spectrum(
+                intensities,
+                model_mode=mode,
+                prediction_model_mode=prediction_model_mode,
+                generator_model_mode=mode,
+            )
 
         def is_flat_generated(result: Dict[str, Any]) -> bool:
             generated = np.asarray(result.get('pred_spectrum_raw', []), dtype=float).reshape(-1)
@@ -147,7 +161,7 @@ def _build_comparison(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
             'ok': True,
             'backend': 'subprocess',
-            'model_mode': result.get('model_mode', model_mode),
+            'model_mode': result.get('resolved_generator_model', result.get('model_mode', model_mode)),
             'wavelengths': list(result.get('wavelengths', [])),
             'input_spectrum': list(result.get('input_resampled', [])),
             'generated_spectrum': generated,
@@ -162,6 +176,12 @@ def _build_comparison(payload: Dict[str, Any]) -> Dict[str, Any]:
                 'intensity_scale': float(result.get('intensity_scale', 1.0)),
                 'intensity_offset': float(result.get('intensity_offset', 0.0)),
                 'generator_supported': bool(generator_supported),
+                'requested_prediction_model': result.get('requested_prediction_model'),
+                'resolved_prediction_model': result.get('resolved_prediction_model'),
+                'requested_generator_model': result.get('requested_generator_model'),
+                'resolved_generator_model': result.get('resolved_generator_model'),
+                'fallback_applied': bool(result.get('fallback_applied', False)),
+                'fallback_reason': result.get('fallback_reason'),
             },
             'error': None,
         }
