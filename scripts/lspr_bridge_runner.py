@@ -39,8 +39,23 @@ def _read_payload() -> Dict[str, Any]:
     return json.loads(raw)
 
 
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_compatible(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if hasattr(value, "tolist"):
+        return _json_compatible(value.tolist())
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
 def _write_payload(payload: Dict[str, Any], exit_code: int = 0) -> int:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+    sys.stdout.write(json.dumps(_json_compatible(payload), ensure_ascii=False))
     sys.stdout.flush()
     return exit_code
 

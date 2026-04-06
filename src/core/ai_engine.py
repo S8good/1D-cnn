@@ -199,7 +199,18 @@ class FullSpectrumAIEngine:
         if mode is None:
             return 0.0
         runtime = self._load_runtime(mode)
-        return self._predict_concentration_with_runtime(runtime, spectrum_ys)
+        prediction = self._predict_concentration_with_runtime(runtime, spectrum_ys)
+        if (
+            runtime.get('predictor_type') == 'fusion'
+            and prediction <= 0.0
+            and mode != 'v2'
+            and 'v2' in self._mode_registry
+        ):
+            stable_runtime = self._load_runtime('v2')
+            stable_prediction = self._predict_concentration_with_runtime(stable_runtime, spectrum_ys)
+            if stable_prediction > 0.0:
+                return stable_prediction
+        return prediction
 
     def interpret_concentration(self, pred_concentration):
         pred = max(0.0, float(pred_concentration))
