@@ -10,6 +10,9 @@ class Stage3Profile:
     predictor_train_mode: str
     predictor_lr: float
     generator_lr: float
+    hill_lr: float
+    generator_init_profile: str
+    generator_warmup_epochs: int
     p_steps: int
     g_steps: int
     w_cycle: float
@@ -21,12 +24,15 @@ class Stage3Profile:
 
 
 _PROFILE_MAP = {
-    "3A-FIXED-FROZEN": Stage3Profile("3A-fixed-frozen", "2.5C", "frozen", 0.0, 1e-4, 0, 1, 0.003, 0.05, 0.02, 0.05, "fixed", 0.0),
+    "3A-FIXED-FROZEN": Stage3Profile("3A-fixed-frozen", "2.5C", "frozen", 0.0, 1e-4, 1e-4, "", 0, 0, 1, 0.003, 0.05, 0.02, 0.05, "fixed", 0.0),
     "3B-FIXED-REGRESSOR": Stage3Profile(
-        "3B-fixed-regressor", "2.5C", "regressor", 1e-4, 1e-4, 1, 1, 0.003, 0.05, 0.02, 0.1, "fixed", 0.0
+        "3B-fixed-regressor", "2.5C", "regressor", 1e-4, 1e-4, 1e-4, "", 0, 1, 1, 0.003, 0.05, 0.02, 0.1, "fixed", 0.0
+    ),
+    "CH-FIXED-REGRESSOR": Stage3Profile(
+        "CH-fixed-regressor", "2.5C", "regressor", 1e-4, 1e-4, 1e-4, "3A-fixed-frozen", 5, 1, 1, 0.0, 0.05, 0.02, 0.1, "fixed", 0.0
     ),
     "3C-LEARNABLE-REGRESSOR": Stage3Profile(
-        "3C-learnable-regressor", "2.5C", "regressor", 1e-4, 1e-4, 1, 1, 0.003, 0.05, 0.02, 0.1, "learnable_kn", 1e-3
+        "3C-learnable-regressor", "2.5C", "regressor", 1e-4, 1e-4, 1e-4, "3A-fixed-frozen", 10, 1, 2, 0.001, 0.05, 0.01, 0.2, "learnable_kn", 1e-4
     ),
 }
 
@@ -43,6 +49,8 @@ def apply_stage3_profile_overrides(args, profile: Stage3Profile):
     args.predictor_train_mode = profile.predictor_train_mode
     args.predictor_lr = profile.predictor_lr
     args.generator_lr = profile.generator_lr
+    args.hill_lr = profile.hill_lr
+    args.generator_warmup_epochs = profile.generator_warmup_epochs
     args.p_steps = profile.p_steps
     args.g_steps = profile.g_steps
     args.w_cycle = profile.w_cycle

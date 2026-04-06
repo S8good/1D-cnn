@@ -29,7 +29,7 @@ def monotonic_penalty(pred_logc: torch.Tensor, true_logc: torch.Tensor) -> torch
 
 
 def predictor_step(predictor, batch, predictor_optimizer, mono_weight):
-    xb, pb, yb, _rb = batch
+    xb, pb, yb, _rb = batch[:4]
     predictor_optimizer.zero_grad()
     pred = predictor(xb, pb)
     loss_conc = F.mse_loss(pred, yb)
@@ -59,7 +59,8 @@ def generator_step_with_hill(
     hill_temperature,
     hill_reg_weight,
 ):
-    _xb, pb, yb, rb = batch
+    _xb, pb, yb, rb = batch[:4]
+    lambda_bsa_nm = batch[4] if len(batch) > 4 else pb[:, 0:1]
     old_flags = [param.requires_grad for param in predictor.parameters()]
     for param in predictor.parameters():
         param.requires_grad = False
@@ -78,7 +79,7 @@ def generator_step_with_hill(
         window_mask=window_mask.to(device=gen_raw.device),
         temperature=hill_temperature,
     )
-    lambda_bsa = pb[:, 0:1]
+    lambda_bsa = lambda_bsa_nm.to(device=gen_raw.device, dtype=gen_raw.dtype)
     conc_ng_ml = torch.clamp(torch.pow(torch.tensor(10.0, dtype=yb.dtype, device=yb.device), yb) - 1e-3, min=0.0)
     delta_lambda_hat = lambda_ag_hat - lambda_bsa
     delta_lambda_target = hill_curve(conc_ng_ml)

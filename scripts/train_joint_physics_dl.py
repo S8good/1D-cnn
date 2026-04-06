@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.core.full_spectrum_models import SpectralPredictorV2_Fusion, SpectrumGenerator
 from src.core.stage3_config import apply_stage3_profile_overrides, build_stage3_profile
-from src.core.stage3_hill import FixedHillCurve, LearnableHillCurve
+from src.core.stage3_hill import FixedHillCurve, LearnableHillCurve, soft_argmax_peak_nm
 from src.core.stage3_training import run_stage3_alternating_epoch
 
 
@@ -194,6 +194,90 @@ def build_hill_curve(args) -> Optional[nn.Module]:
     raise ValueError(f"Unsupported hill mode: {args.hill_mode}")
 
 
+def resolve_generator_init_weights(args) -> str:
+    return str(getattr(args, "generator_init_weights", "") or "")
+
+
+def build_joint_optimizer(
+    trainable_predictor_params,
+    generator: nn.Module,
+    predictor_lr: float,
+    generator_lr: float,
+    hill_lr: Optional[float] = None,
+    hill_curve: Optional[nn.Module] = None,
+):
+    optim_groups = []
+    if trainable_predictor_params:
+        optim_groups.append({"params": trainable_predictor_params, "lr": float(predictor_lr)})
+    optim_groups.append({"params": generator.parameters(), "lr": float(generator_lr)})
+    if isinstance(hill_curve, LearnableHillCurve):
+        optim_groups.append({"params": hill_curve.parameters(), "lr": float(hill_lr if hill_lr is not None else generator_lr)})
+    return optim.AdamW(optim_groups, weight_decay=3e-4)
+
+
+def hill_curve_parameter_snapshot(hill_curve: Optional[nn.Module]) -> Dict[str, float]:
+    if hill_curve is None:
+        return {}
+    if hasattr(hill_curve, "constrained_parameters"):
+        delta_lambda_max, k_half, hill_n = hill_curve.constrained_parameters()
+    else:
+        delta_lambda_max = getattr(hill_curve, "delta_lambda_max")
+        k_half = getattr(hill_curve, "k_half")
+        hill_n = getattr(hill_curve, "hill_n")
+    return {
+        "delta_lambda_max": float(delta_lambda_max.detach().cpu().item()),
+        "k_half": float(k_half.detach().cpu().item()),
+        "hill_n": float(hill_n.detach().cpu().item()),
+    }
+
+
+def run_generator_hill_warmup(
+    predictor,
+    generator,
+    train_loader,
+    generator_optimizer,
+    hill_context,
+    g_steps: int,
+    cycle_weight: float,
+    recon_weight: float,
+    hill_weight: float,
+    warmup_epochs: int,
+):
+    warmup_history = []
+    if warmup_epochs <= 0 or not (hill_context and hill_context.get("enabled")):
+        return warmup_history
+    for epoch in range(warmup_epochs):
+        predictor.eval()
+        generator.train()
+        stats = run_stage3_alternating_epoch(
+            predictor=predictor,
+            generator=generator,
+            train_batches=train_loader,
+            wavelengths_nm=hill_context["wavelengths_nm"],
+            predictor_optimizer=generator_optimizer,
+            generator_optimizer=generator_optimizer,
+            hill_curve=hill_context["hill_curve"],
+            p_steps=0,
+            g_steps=max(int(g_steps), 1),
+            mono_weight=0.0,
+            cycle_weight=cycle_weight,
+            recon_weight=recon_weight,
+            hill_weight=hill_weight,
+            hill_window_center_nm=hill_context["hill_window_center_nm"],
+            hill_window_half_width_nm=hill_context["hill_window_half_width_nm"],
+            hill_temperature=hill_context["hill_temperature"],
+            hill_reg_weight=hill_context["hill_reg_weight"],
+        )
+        stats["epoch"] = epoch + 1
+        warmup_history.append(stats)
+        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch + 1 == warmup_epochs:
+            print(
+                f"Warmup {epoch + 1:3d}/{warmup_epochs} | "
+                f"gen={float(stats['generator_loss']):.5f} | hill={float(stats['generator_loss_hill']):.5f}"
+            )
+    return warmup_history
+
+
 def run_joint_training_epoch(
     predictor,
     generator,
@@ -278,6 +362,62 @@ def evaluate_regression(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> Dict[
     return {"mae_ng_ml": mae, "rmse_ng_ml": rmse, "mape_pct": mape, "r2": r2}
 
 
+def monotonicity_violation_rate(y_true_log: np.ndarray, y_pred_log: np.ndarray) -> float:
+    if len(y_true_log) < 2:
+        return 0.0
+    order = np.argsort(y_true_log.reshape(-1), kind="mergesort")
+    sorted_pred = y_pred_log.reshape(-1)[order]
+    violations = sorted_pred[:-1] > sorted_pred[1:]
+    return float(np.mean(violations.astype(np.float32)))
+
+
+def evaluate_hill_consistency(
+    generator: nn.Module,
+    y_true_log: np.ndarray,
+    physics_raw: np.ndarray,
+    wavelengths_nm: np.ndarray,
+    hill_curve: Optional[nn.Module],
+    hill_window_center_nm: float,
+    hill_window_half_width_nm: float,
+    hill_temperature: float,
+    device: torch.device,
+) -> Dict[str, float]:
+    if hill_curve is None:
+        return {"hill_consistency_mae_nm": float("nan")}
+
+    y_true_tensor = torch.as_tensor(y_true_log, dtype=torch.float32, device=device).reshape(-1, 1)
+    physics_raw_tensor = torch.as_tensor(physics_raw, dtype=torch.float32, device=device)
+    wavelengths_tensor = torch.as_tensor(wavelengths_nm, dtype=torch.float32, device=device)
+    window_mask = torch.abs(wavelengths_tensor - float(hill_window_center_nm)) <= float(hill_window_half_width_nm)
+    if not bool(window_mask.any()):
+        raise ValueError("Hill evaluation window does not overlap the wavelength grid.")
+
+    generator_was_training = generator.training
+    hill_curve_was_training = hill_curve.training
+    generator.eval()
+    hill_curve.eval()
+    with torch.no_grad():
+        generated = generator(y_true_tensor).squeeze(1)
+        lambda_ag_hat = soft_argmax_peak_nm(
+            generated,
+            wavelengths_nm=wavelengths_tensor,
+            window_mask=window_mask,
+            temperature=float(hill_temperature),
+        )
+        lambda_bsa = physics_raw_tensor[:, 0:1]
+        conc_ng_ml = torch.clamp(torch.pow(torch.full_like(y_true_tensor, 10.0), y_true_tensor) - 1e-3, min=0.0)
+        delta_lambda_hat = lambda_ag_hat - lambda_bsa
+        delta_lambda_target = hill_curve(conc_ng_ml)
+        hill_residual = delta_lambda_hat - delta_lambda_target
+        metrics = {"hill_consistency_mae_nm": float(torch.mean(torch.abs(hill_residual)).cpu().item())}
+
+    if generator_was_training:
+        generator.train()
+    if hill_curve_was_training:
+        hill_curve.train()
+    return metrics
+
+
 def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -343,6 +483,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=os.path.join(root, "models", "pretrained", "spectral_generator_cycle.pth"),
     )
+    parser.add_argument("--generator-init-weights", type=str, default="")
+    parser.add_argument("--generator-warmup-epochs", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260325)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--pretrain-gen-epochs", type=int, default=40)
@@ -364,7 +506,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage3-profile",
         type=str,
-        choices=["3A-fixed-frozen", "3B-fixed-regressor", "3C-learnable-regressor"],
+        choices=["3A-fixed-frozen", "3B-fixed-regressor", "CH-fixed-regressor", "3C-learnable-regressor"],
     )
     parser.add_argument("--hill-mode", type=str, default="off", choices=["off", "fixed", "learnable_kn", "learnable_all"])
     parser.add_argument(
@@ -374,6 +516,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--w-hill", type=float, default=0.0)
     parser.add_argument("--hill-reg-weight", type=float, default=0.0)
+    parser.add_argument("--hill-lr", type=float, default=1e-4)
     parser.add_argument("--hill-window-center-nm", type=float, default=603.0)
     parser.add_argument("--hill-window-half-width-nm", type=float, default=15.0)
     parser.add_argument("--hill-temperature", type=float, default=0.25)
@@ -452,12 +595,20 @@ def main() -> None:
     raw_train = x_train[:, 0, :]
     raw_val = x_val[:, 0, :]
     raw_test = x_test[:, 0, :]
+    lambda_bsa_train = phy_train[:, 0:1]
 
     train_ds = TensorDataset(
         torch.from_numpy(x_train),
         torch.from_numpy(p_train),
         torch.from_numpy(y_train.reshape(-1, 1).astype(np.float32)),
         torch.from_numpy(raw_train.astype(np.float32)),
+    )
+    train_stage3_ds = TensorDataset(
+        torch.from_numpy(x_train),
+        torch.from_numpy(p_train),
+        torch.from_numpy(y_train.reshape(-1, 1).astype(np.float32)),
+        torch.from_numpy(raw_train.astype(np.float32)),
+        torch.from_numpy(lambda_bsa_train.astype(np.float32)),
     )
     val_ds = TensorDataset(
         torch.from_numpy(x_val),
@@ -473,6 +624,7 @@ def main() -> None:
     )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    train_stage3_loader = DataLoader(train_stage3_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
 
@@ -487,6 +639,14 @@ def main() -> None:
         print(f"Loaded generator: {gen_path}")
     else:
         print("Generator weights not found, using random init.")
+
+    generator_init_path = resolve_generator_init_weights(args)
+    if generator_init_path:
+        generator_init_path = os.path.abspath(generator_init_path)
+        if not os.path.exists(generator_init_path):
+            raise FileNotFoundError(f"Generator init weights not found: {generator_init_path}")
+        generator.load_state_dict(torch.load(generator_init_path, map_location="cpu"))
+        print(f"Loaded generator init override: {generator_init_path}")
 
     # Optional generator warm-up on concentration->spectrum mapping.
     if args.pretrain_gen_epochs > 0:
@@ -516,11 +676,18 @@ def main() -> None:
         f"trainable_params={predictor_trainable_count}/{predictor_total_count}"
     )
 
-    optim_groups = []
-    if trainable_predictor_params:
-        optim_groups.append({"params": trainable_predictor_params, "lr": float(args.predictor_lr)})
-    optim_groups.append({"params": generator.parameters(), "lr": float(args.generator_lr)})
-    optimizer = optim.AdamW(optim_groups, weight_decay=3e-4)
+    hill_curve = build_hill_curve(args)
+    if hill_curve is not None:
+        hill_curve = hill_curve.to(device)
+
+    optimizer = build_joint_optimizer(
+        trainable_predictor_params=trainable_predictor_params,
+        generator=generator,
+        predictor_lr=float(args.predictor_lr),
+        generator_lr=float(args.generator_lr),
+        hill_lr=float(args.hill_lr),
+        hill_curve=hill_curve,
+    )
     predictor_optimizer = optimizer if trainable_predictor_params else optim.AdamW(
         [{"params": [torch.zeros(1, requires_grad=True)], "lr": float(args.predictor_lr)}]
     )
@@ -529,9 +696,6 @@ def main() -> None:
     huber = nn.HuberLoss(delta=0.2)
     mse = nn.MSELoss()
 
-    hill_curve = build_hill_curve(args)
-    if hill_curve is not None:
-        hill_curve = hill_curve.to(device)
     hill_context = {
         "enabled": hill_curve is not None and float(args.w_hill) > 0.0,
         "hill_curve": hill_curve,
@@ -542,8 +706,25 @@ def main() -> None:
         "hill_reg_weight": float(args.hill_reg_weight),
     }
 
+    warmup_history = run_generator_hill_warmup(
+        predictor=predictor,
+        generator=generator,
+        train_loader=[
+            tuple(item.to(device) for item in batch)
+            for batch in train_stage3_loader
+        ],
+        generator_optimizer=generator_optimizer,
+        hill_context=hill_context,
+        g_steps=int(getattr(args, "g_steps", 1)),
+        cycle_weight=float(args.w_cycle),
+        recon_weight=float(args.w_recon),
+        hill_weight=float(args.w_hill),
+        warmup_epochs=int(getattr(args, "generator_warmup_epochs", 0)),
+    )
+
     best_val = float("inf")
     best_state = None
+    hill_param_history = []
     for epoch in range(args.joint_epochs):
         if not trainable_predictor_params:
             predictor.eval()
@@ -557,8 +738,8 @@ def main() -> None:
             predictor=predictor,
             generator=generator,
             train_loader=[
-                (xb.to(device), pb.to(device), yb.to(device), rb.to(device))
-                for xb, pb, yb, rb in train_loader
+                tuple(item.to(device) for item in batch)
+                for batch in (train_stage3_loader if hill_context["enabled"] else train_loader)
             ],
             predictor_optimizer=optimizer,
             generator_optimizer=optimizer,
@@ -574,6 +755,10 @@ def main() -> None:
         )
 
         val_loss, _, _ = evaluate_predictor(predictor, val_loader, device)
+        if hill_curve is not None:
+            snapshot = {"epoch": epoch + 1}
+            snapshot.update(hill_curve_parameter_snapshot(hill_curve))
+            hill_param_history.append(snapshot)
         scheduler.step(val_loss)
         if val_loss < best_val:
             best_val = val_loss
@@ -581,6 +766,7 @@ def main() -> None:
                 "predictor": {k: v.detach().cpu().clone() for k, v in predictor.state_dict().items()},
                 "generator": {k: v.detach().cpu().clone() for k, v in generator.state_dict().items()},
                 "epoch": epoch + 1,
+                "hill_parameters": hill_curve_parameter_snapshot(hill_curve),
             }
         if (epoch + 1) % 20 == 0:
             print(
@@ -594,6 +780,21 @@ def main() -> None:
 
     _, y_true, y_pred = evaluate_predictor(predictor, test_loader, device)
     test_metrics = evaluate_regression(y_true, y_pred)
+    constraint_metrics = {
+        "monotonicity_violation_rate": monotonicity_violation_rate(y_true, y_pred),
+        **evaluate_hill_consistency(
+            generator=generator,
+            y_true_log=y_true,
+            physics_raw=phy_test,
+            wavelengths_nm=wl_test,
+            hill_curve=hill_curve,
+            hill_window_center_nm=float(args.hill_window_center_nm),
+            hill_window_half_width_nm=float(args.hill_window_half_width_nm),
+            hill_temperature=float(args.hill_temperature),
+            device=device,
+        ),
+    }
+    constraint_metrics.update(hill_curve_parameter_snapshot(hill_curve))
 
     output_tag = build_output_tag(stage25_profile=stage25_profile, stage3_profile=args.stage3_profile)
     pred_out = os.path.join(pretrained_dir, f"spectral_predictor_v2_{output_tag}.pth")
@@ -617,10 +818,17 @@ def main() -> None:
                 "w_recon": float(args.w_recon),
                 "w_hill": float(args.w_hill),
             },
+            "hill_lr": float(args.hill_lr),
             "predictor_train_mode": str(predictor_train_mode),
             "predictor_trainable_params": int(predictor_trainable_count),
             "stage3_profile": str(args.stage3_profile or ""),
             "hill_mode": str(args.hill_mode),
+            "generator_init_weights": str(resolve_generator_init_weights(args)),
+            "generator_warmup_epochs": int(getattr(args, "generator_warmup_epochs", 0)),
+            "generator_warmup_history": warmup_history,
+            "hill_parameters": hill_curve_parameter_snapshot(hill_curve),
+            "hill_param_history": hill_param_history,
+            "best_hill_parameters": best_state.get("hill_parameters", {}) if best_state else {},
         },
         ckpt_out,
     )
@@ -644,6 +852,7 @@ def main() -> None:
                 "joint_epochs": int(args.joint_epochs),
                 "predictor_lr": float(args.predictor_lr),
                 "generator_lr": float(args.generator_lr),
+                "hill_lr": float(args.hill_lr),
                 "freeze_predictor": bool(args.freeze_predictor),
                 "predictor_train_mode": str(predictor_train_mode),
                 "predictor_trainable_params": int(predictor_trainable_count),
@@ -655,6 +864,7 @@ def main() -> None:
                 "stage3_profile": str(args.stage3_profile or ""),
                 "hill_mode": str(args.hill_mode),
                 **test_metrics,
+                **constraint_metrics,
             }
         ]
     ).to_csv(metrics_path, index=False)
@@ -671,6 +881,10 @@ def main() -> None:
     print(
         f"  MAE={test_metrics['mae_ng_ml']:.6f} ng/ml | RMSE={test_metrics['rmse_ng_ml']:.6f} ng/ml | "
         f"MAPE={test_metrics['mape_pct']:.3f}% | R2={test_metrics['r2']:.6f}"
+    )
+    print(
+        f"  MVR={constraint_metrics['monotonicity_violation_rate']:.6f} | "
+        f"Hill-MAE={constraint_metrics['hill_consistency_mae_nm']:.6f} nm"
     )
     print(f"Saved: {pred_out}")
     print(f"Saved: {gen_out}")

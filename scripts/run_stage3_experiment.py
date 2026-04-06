@@ -26,11 +26,12 @@ def build_stage3_run_paths(source_root: Path):
         "fusion_norm": pretrained_root / "predictor_v2_fusion_norm_params.pth",
         "generator_weights": pretrained_root / "spectral_generator_cycle.pth",
         "hill_params": pretrained_root / "stage3_hill_params.pth",
+        "stage3_3a_generator": pretrained_root / "spectral_generator_stage3_3a_fixed_frozen.pth",
     }
 
 
 def build_train_command(paths, profile: str, seed: int, joint_epochs: int, pretrain_gen_epochs: int):
-    return [
+    command = [
         sys.executable,
         "scripts/train_joint_physics_dl.py",
         "--stage3-profile",
@@ -58,6 +59,18 @@ def build_train_command(paths, profile: str, seed: int, joint_epochs: int, pretr
         "--hill-params-path",
         str(paths["hill_params"]),
     ]
+    if profile in {"3C-learnable-regressor", "CH-fixed-regressor"}:
+        command.extend(
+            [
+                "--generator-init-weights",
+                str(paths["stage3_3a_generator"]),
+            ]
+        )
+    if profile == "3C-learnable-regressor":
+        command.extend(["--generator-warmup-epochs", "10"])
+    if profile == "CH-fixed-regressor":
+        command.extend(["--generator-warmup-epochs", "5"])
+    return command
 
 
 def snapshot_stage3_outputs(source_root: Path, run_name: str):
