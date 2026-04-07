@@ -13,6 +13,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.core.full_spectrum_models import SpectralPredictorV2_Fusion, SpectrumGenerator
+from src.core.stage25_config import apply_profile_overrides, build_stage25_profile
+from src.core.stage25_training import run_alternating_epoch
 
 
 def _prepare_model_dirs(project_root: str):
@@ -216,6 +218,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-epochs", type=int, default=180)
     parser.add_argument("--predictor-lr", type=float, default=2e-4)
     parser.add_argument("--generator-lr", type=float, default=1e-3)
+    parser.add_argument("--update-strategy", type=str, default="joint", choices=["joint", "alternating"])
+    parser.add_argument("--stage25-profile", type=str, choices=["2.5A", "2.5B", "2.5C"])
     parser.add_argument("--freeze-predictor", action="store_true")
     parser.add_argument(
         "--predictor-train-mode",
@@ -228,7 +232,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-cycle", type=float, default=0.1)
     parser.add_argument("--w-mono", type=float, default=0.05)
     parser.add_argument("--w-recon", type=float, default=0.05)
-    return parser.parse_args()
+    parser.add_argument("--p-steps", type=int, default=1)
+    parser.add_argument("--g-steps", type=int, default=1)
+    args = parser.parse_args()
+    if args.stage25_profile:
+        apply_stage25_profile(args, build_stage25_profile(args.stage25_profile))
+    return args
 
 
 def _tensor_gradient_1d(x: torch.Tensor) -> torch.Tensor:
@@ -258,12 +267,106 @@ def evaluate_predictor(
     return float(np.mean(losses)), np.concatenate(ys), np.concatenate(ps)
 
 
+def apply_stage25_profile(args: argparse.Namespace, profile) -> argparse.Namespace:
+    return apply_profile_overrides(args, profile)
+
+
+def build_output_tag(stage25_profile: str) -> str:
+    if not stage25_profile:
+        return "cycle"
+    return f"stage25_{stage25_profile.lower().replace('.', 'p')}"
+
+
+def run_joint_training_epoch(
+    predictor,
+    generator,
+    train_loader,
+    predictor_optimizer,
+    generator_optimizer,
+    update_strategy: str,
+    mono_weight: float,
+    cycle_weight: float,
+    recon_weight: float,
+    p_steps: int,
+    g_steps: int,
+    *,
+    alternating_runner=run_alternating_epoch,
+    joint_optimizer=None,
+    device=None,
+    huber_loss=None,
+    mse_loss=None,
+    conc_weight: float = 1.0,
+):
+    if update_strategy == "alternating":
+        if predictor_optimizer is None and p_steps > 0:
+            raise ValueError("predictor_optimizer is required when alternating predictor updates are enabled.")
+        if generator_optimizer is None and g_steps > 0:
+            raise ValueError("generator_optimizer is required when alternating generator updates are enabled.")
+        stats = alternating_runner(
+            predictor=predictor,
+            generator=generator,
+            train_batches=train_loader,
+            predictor_optimizer=predictor_optimizer,
+            generator_optimizer=generator_optimizer,
+            p_steps=p_steps,
+            g_steps=g_steps,
+            mono_weight=mono_weight,
+            cycle_weight=cycle_weight,
+            recon_weight=recon_weight,
+        )
+        return {
+            "loss": float((stats["predictor_loss"] + stats["generator_loss"]) * 0.5),
+            "predictor_steps": int(stats["predictor_steps"]),
+            "generator_steps": int(stats["generator_steps"]),
+            "predictor_loss": float(stats["predictor_loss"]),
+            "generator_loss": float(stats["generator_loss"]),
+        }
+
+    if joint_optimizer is None or device is None or huber_loss is None or mse_loss is None:
+        raise ValueError("joint strategy requires joint_optimizer, device, huber_loss, and mse_loss.")
+
+    losses = []
+    for xb, pb, yb, rb in train_loader:
+        xb = xb.to(device)
+        pb = pb.to(device)
+        yb = yb.to(device)
+        rb = rb.to(device)
+
+        joint_optimizer.zero_grad()
+        pred_real = predictor(xb, pb)
+        loss_conc = huber_loss(pred_real, yb)
+
+        gen_raw = generator(yb).squeeze(1)
+        gen_diff = _tensor_gradient_1d(gen_raw)
+        x_gen = torch.stack([gen_raw, gen_diff], dim=1)
+        pred_cycle = predictor(x_gen, pb)
+        loss_cycle = mse_loss(pred_cycle, yb)
+        loss_mono = monotonic_penalty(pred_real, yb)
+        loss_recon = mse_loss(gen_raw, rb)
+
+        loss = conc_weight * loss_conc + cycle_weight * loss_cycle + mono_weight * loss_mono + recon_weight * loss_recon
+        loss.backward()
+        joint_optimizer.step()
+        losses.append(loss.item())
+
+    return {
+        "loss": float(np.mean(losses)) if losses else 0.0,
+        "predictor_steps": len(train_loader),
+        "generator_steps": len(train_loader),
+        "predictor_loss": 0.0,
+        "generator_loss": 0.0,
+    }
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = torch.device("cpu")
     print(f"Using device: {device}")
     print(f"Seed: {args.seed}")
+    print(f"Update strategy: {args.update_strategy}")
+    if args.stage25_profile:
+        print(f"Stage 2.5 profile: {args.stage25_profile}")
 
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     _models_root, checkpoints_dir, pretrained_dir = _prepare_model_dirs(root)
@@ -369,6 +472,17 @@ def main() -> None:
     optim_groups.append({"params": generator.parameters(), "lr": float(args.generator_lr)})
     optimizer = optim.AdamW(optim_groups, weight_decay=3e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
+    predictor_optimizer = None
+    predictor_scheduler = None
+    if trainable_predictor_params:
+        predictor_optimizer = optim.AdamW(trainable_predictor_params, lr=float(args.predictor_lr), weight_decay=3e-4)
+        predictor_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            predictor_optimizer, mode="min", factor=0.5, patience=10
+        )
+    generator_optimizer = optim.AdamW(generator.parameters(), lr=float(args.generator_lr), weight_decay=3e-4)
+    generator_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        generator_optimizer, mode="min", factor=0.5, patience=10
+    )
     huber = nn.HuberLoss(delta=0.2)
     mse = nn.MSELoss()
 
@@ -383,37 +497,32 @@ def main() -> None:
                 # Keep frozen branches in eval mode to avoid BN/Dropout drift.
                 set_frozen_submodules_eval(predictor)
         generator.train()
-        losses = []
-        for xb, pb, yb, rb in train_loader:
-            xb = xb.to(device)
-            pb = pb.to(device)
-            yb = yb.to(device)
-            rb = rb.to(device)
-
-            optimizer.zero_grad()
-            pred_real = predictor(xb, pb)
-            loss_conc = huber(pred_real, yb)
-
-            gen_raw = generator(yb).squeeze(1)
-            gen_diff = _tensor_gradient_1d(gen_raw)
-            x_gen = torch.stack([gen_raw, gen_diff], dim=1)
-            pred_cycle = predictor(x_gen, pb)
-            loss_cycle = mse(pred_cycle, yb)
-            loss_mono = monotonic_penalty(pred_real, yb)
-            loss_recon = mse(gen_raw, rb)
-
-            loss = (
-                args.w_conc * loss_conc
-                + args.w_cycle * loss_cycle
-                + args.w_mono * loss_mono
-                + args.w_recon * loss_recon
-            )
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
+        train_stats = run_joint_training_epoch(
+            predictor=predictor,
+            generator=generator,
+            train_loader=train_loader,
+            predictor_optimizer=predictor_optimizer,
+            generator_optimizer=generator_optimizer,
+            update_strategy=args.update_strategy,
+            mono_weight=args.w_mono,
+            cycle_weight=args.w_cycle,
+            recon_weight=args.w_recon,
+            p_steps=args.p_steps,
+            g_steps=args.g_steps,
+            joint_optimizer=optimizer,
+            device=device,
+            huber_loss=huber,
+            mse_loss=mse,
+            conc_weight=args.w_conc,
+        )
 
         val_loss, _, _ = evaluate_predictor(predictor, val_loader, device)
-        scheduler.step(val_loss)
+        if args.update_strategy == "alternating":
+            if predictor_scheduler is not None:
+                predictor_scheduler.step(val_loss)
+            generator_scheduler.step(val_loss)
+        else:
+            scheduler.step(val_loss)
         if val_loss < best_val:
             best_val = val_loss
             best_state = {
@@ -422,9 +531,16 @@ def main() -> None:
                 "epoch": epoch + 1,
             }
         if (epoch + 1) % 20 == 0:
+            if args.update_strategy == "alternating":
+                if predictor_optimizer is not None:
+                    lr_display = predictor_optimizer.param_groups[0]["lr"]
+                else:
+                    lr_display = generator_optimizer.param_groups[0]["lr"]
+            else:
+                lr_display = optimizer.param_groups[0]["lr"]
             print(
-                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={float(np.mean(losses)):.5f} | "
-                f"val={val_loss:.5f} | lr={optimizer.param_groups[0]['lr']:.2e}"
+                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={train_stats['loss']:.5f} | "
+                f"val={val_loss:.5f} | lr={lr_display:.2e}"
             )
 
     if best_state is not None:
@@ -434,14 +550,15 @@ def main() -> None:
     _, y_true, y_pred = evaluate_predictor(predictor, test_loader, device)
     test_metrics = evaluate_regression(y_true, y_pred)
 
-    pred_out = os.path.join(pretrained_dir, "spectral_predictor_v2_cycle.pth")
-    gen_out = os.path.join(pretrained_dir, "spectral_generator_cycle.pth")
-    params_out = os.path.join(pretrained_dir, "predictor_v2_cycle_norm_params.pth")
+    output_tag = build_output_tag(args.stage25_profile)
+    pred_out = os.path.join(pretrained_dir, f"spectral_predictor_v2_{output_tag}.pth")
+    gen_out = os.path.join(pretrained_dir, f"spectral_generator_{output_tag}.pth")
+    params_out = os.path.join(pretrained_dir, f"predictor_v2_{output_tag}_norm_params.pth")
     torch.save(predictor.state_dict(), pred_out)
     torch.save(generator.state_dict(), gen_out)
     torch.save(norm_params, params_out)
 
-    ckpt_out = os.path.join(checkpoints_dir, "joint_cycle_best.pth")
+    ckpt_out = os.path.join(checkpoints_dir, f"joint_{output_tag}_best.pth")
     torch.save(
         {
             "best_epoch": int(best_state["epoch"] if best_state else args.joint_epochs),
@@ -454,16 +571,20 @@ def main() -> None:
                 "w_mono": float(args.w_mono),
                 "w_recon": float(args.w_recon),
             },
+            "stage25_profile": args.stage25_profile,
+            "update_strategy": str(args.update_strategy),
             "predictor_train_mode": str(predictor_train_mode),
             "predictor_trainable_params": int(predictor_trainable_count),
+            "p_steps": int(args.p_steps),
+            "g_steps": int(args.g_steps),
         },
         ckpt_out,
     )
 
     out_dir = os.path.join(root, "outputs")
     os.makedirs(out_dir, exist_ok=True)
-    metrics_path = os.path.join(out_dir, "split_test_metrics_predictor_v2_cycle.csv")
-    details_path = os.path.join(out_dir, "split_test_predictions_predictor_v2_cycle.csv")
+    metrics_path = os.path.join(out_dir, f"split_test_metrics_predictor_v2_{output_tag}.csv")
+    details_path = os.path.join(out_dir, f"split_test_predictions_predictor_v2_{output_tag}.csv")
     pd.DataFrame(
         [
             {
@@ -477,11 +598,15 @@ def main() -> None:
                 "seed": int(args.seed),
                 "pretrain_gen_epochs": int(args.pretrain_gen_epochs),
                 "joint_epochs": int(args.joint_epochs),
+                "stage25_profile": args.stage25_profile or "",
+                "update_strategy": str(args.update_strategy),
                 "predictor_lr": float(args.predictor_lr),
                 "generator_lr": float(args.generator_lr),
                 "freeze_predictor": bool(args.freeze_predictor),
                 "predictor_train_mode": str(predictor_train_mode),
                 "predictor_trainable_params": int(predictor_trainable_count),
+                "p_steps": int(args.p_steps),
+                "g_steps": int(args.g_steps),
                 "w_conc": float(args.w_conc),
                 "w_cycle": float(args.w_cycle),
                 "w_mono": float(args.w_mono),
