@@ -13,6 +13,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from src.core.full_spectrum_models import SpectralPredictorV2_Fusion, SpectrumGenerator
+from src.core.stage25_config import apply_profile_overrides, build_stage25_profile
+from src.core.stage25_training import run_alternating_epoch
 from src.core.stage3_config import apply_stage3_profile_overrides, build_stage3_profile
 from src.core.stage3_hill import FixedHillCurve, LearnableHillCurve
 from src.core.stage3_training import run_stage3_alternating_epoch
@@ -167,6 +169,10 @@ def apply_stage3_profile(args, profile):
     return apply_stage3_profile_overrides(args, profile)
 
 
+def apply_stage25_profile(args, profile):
+    return apply_profile_overrides(args, profile)
+
+
 def build_output_tag(stage25_profile: Optional[str], stage3_profile: Optional[str] = "") -> str:
     if stage3_profile:
         return "stage3_" + stage3_profile.lower().replace("-", "_")
@@ -207,11 +213,12 @@ def run_joint_training_epoch(
     p_steps,
     g_steps,
     hill_weight,
+    alternating_runner=run_alternating_epoch,
     stage3_runner=None,
     hill_context=None,
 ):
     if hill_context and hill_context.get("enabled"):
-        return stage3_runner(
+        stats = stage3_runner(
             predictor=predictor,
             generator=generator,
             train_batches=train_loader,
@@ -230,6 +237,29 @@ def run_joint_training_epoch(
             hill_temperature=hill_context.get("hill_temperature"),
             hill_reg_weight=hill_context.get("hill_reg_weight", 0.0),
         )
+        return {
+            "loss": float((stats.get("predictor_loss", 0.0) + stats.get("generator_loss", 0.0)) * 0.5),
+            **stats,
+        }
+
+    if str(update_strategy).lower() == "alternating":
+        stats = alternating_runner(
+            predictor=predictor,
+            generator=generator,
+            train_batches=train_loader,
+            predictor_optimizer=predictor_optimizer,
+            generator_optimizer=generator_optimizer,
+            p_steps=int(p_steps),
+            g_steps=int(g_steps),
+            mono_weight=float(mono_weight),
+            cycle_weight=float(cycle_weight),
+            recon_weight=float(recon_weight),
+        )
+        return {
+            "loss": float((stats.get("predictor_loss", 0.0) + stats.get("generator_loss", 0.0)) * 0.5),
+            **stats,
+            "generator_loss_hill": 0.0,
+        }
 
     losses = []
     huber = nn.HuberLoss(delta=0.2)
@@ -254,6 +284,7 @@ def run_joint_training_epoch(
         losses.append(float(loss.detach().cpu().item()))
 
     return {
+        "loss": float(np.mean(losses)) if losses else 0.0,
         "predictor_steps": 0,
         "generator_steps": 0,
         "predictor_loss": 0.0,
@@ -349,6 +380,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--joint-epochs", type=int, default=180)
     parser.add_argument("--predictor-lr", type=float, default=2e-4)
     parser.add_argument("--generator-lr", type=float, default=1e-3)
+    parser.add_argument("--update-strategy", type=str, default="joint", choices=["joint", "alternating"])
+    parser.add_argument("--stage25-profile", type=str, choices=["2.5A", "2.5B", "2.5C"])
     parser.add_argument("--freeze-predictor", action="store_true")
     parser.add_argument(
         "--predictor-train-mode",
@@ -361,6 +394,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-cycle", type=float, default=0.1)
     parser.add_argument("--w-mono", type=float, default=0.05)
     parser.add_argument("--w-recon", type=float, default=0.05)
+    parser.add_argument("--p-steps", type=int, default=1)
+    parser.add_argument("--g-steps", type=int, default=1)
     parser.add_argument(
         "--stage3-profile",
         type=str,
@@ -378,6 +413,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hill-window-half-width-nm", type=float, default=15.0)
     parser.add_argument("--hill-temperature", type=float, default=0.25)
     args = parser.parse_args()
+    if args.stage25_profile:
+        apply_stage25_profile(args, build_stage25_profile(args.stage25_profile))
     if args.stage3_profile:
         apply_stage3_profile(args, build_stage3_profile(args.stage3_profile))
     return args
@@ -416,6 +453,9 @@ def main() -> None:
     device = torch.device("cpu")
     print(f"Using device: {device}")
     print(f"Seed: {args.seed}")
+    print(f"Update strategy: {args.update_strategy}")
+    if args.stage25_profile:
+        print(f"Stage 2.5 profile: {args.stage25_profile}")
 
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     _models_root, checkpoints_dir, pretrained_dir = _prepare_model_dirs(root)
@@ -440,7 +480,7 @@ def main() -> None:
     specs_test, phy_test, y_test, wl_test = parse_training_data_fusion(test_path, bsa_lookup)
     if not (np.allclose(wl_train, wl_val) and np.allclose(wl_train, wl_test)):
         raise RuntimeError("Train/val/test wavelength grids are not identical.")
-    stage25_profile = "2.5C" if args.predictor_train_mode in {"frozen", "regressor"} else ""
+    stage25_profile = args.stage25_profile or ("2.5C" if args.predictor_train_mode in {"frozen", "regressor"} else "")
 
     x_train = build_input_channels(specs_train, stats)
     x_val = build_input_channels(specs_val, stats)
@@ -584,7 +624,7 @@ def main() -> None:
             }
         if (epoch + 1) % 20 == 0:
             print(
-                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={float(epoch_stats['generator_loss']):.5f} | "
+                f"Joint {epoch + 1:3d}/{args.joint_epochs} | train={float(epoch_stats.get('loss', epoch_stats['generator_loss'])):.5f} | "
                 f"val={val_loss:.5f} | lr={optimizer.param_groups[0]['lr']:.2e}"
             )
 
@@ -617,8 +657,12 @@ def main() -> None:
                 "w_recon": float(args.w_recon),
                 "w_hill": float(args.w_hill),
             },
+            "stage25_profile": str(args.stage25_profile or ""),
+            "update_strategy": str(args.update_strategy),
             "predictor_train_mode": str(predictor_train_mode),
             "predictor_trainable_params": int(predictor_trainable_count),
+            "p_steps": int(args.p_steps),
+            "g_steps": int(args.g_steps),
             "stage3_profile": str(args.stage3_profile or ""),
             "hill_mode": str(args.hill_mode),
         },
@@ -642,11 +686,15 @@ def main() -> None:
                 "seed": int(args.seed),
                 "pretrain_gen_epochs": int(args.pretrain_gen_epochs),
                 "joint_epochs": int(args.joint_epochs),
+                "stage25_profile": str(args.stage25_profile or ""),
+                "update_strategy": str(args.update_strategy),
                 "predictor_lr": float(args.predictor_lr),
                 "generator_lr": float(args.generator_lr),
                 "freeze_predictor": bool(args.freeze_predictor),
                 "predictor_train_mode": str(predictor_train_mode),
                 "predictor_trainable_params": int(predictor_trainable_count),
+                "p_steps": int(args.p_steps),
+                "g_steps": int(args.g_steps),
                 "w_conc": float(args.w_conc),
                 "w_cycle": float(args.w_cycle),
                 "w_mono": float(args.w_mono),
